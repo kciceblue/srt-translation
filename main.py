@@ -4,15 +4,15 @@
 srt_translate_client.py
 
 What it does
-1) Read multiple .srt files, parse blocks, extract text lines only.
-2) Send text lines to a backend API in an OpenAI "messages" format,
-   using a numbered-line protocol ([N] text) for robust line mapping.
-3) The model translates and also fixes potential ASR/Whisper transcription
-   errors using surrounding context.
-4) Rebuild .srt with original timestamps and translated lines.
+1) Read .srt files from files, directories, or glob patterns.
+2) Group files by series using the LLM (auto-detect which files belong together).
+3) Translate each series with shared context (glossary of character names/terms).
+4) Uses numbered-line protocol ([N] text) and streaming with loop detection.
+5) Rebuild .srt with original timestamps and translated lines.
 
 Backend expectations (flexible)
 - Accepts POST JSON: {"messages": [...]} (plus optional extra fields)
+- Supports SSE streaming when {"stream": true} is included
 - Returns either:
   A) OpenAI-like JSON: {"choices":[{"message":{"content":"..."} }]}
   B) Simple JSON: {"text":"..."}  (or similar)
@@ -38,6 +38,11 @@ except ImportError:
     sys.exit(2)
 
 
+class LoopDetectedError(RuntimeError):
+    """Raised when streaming response exhibits infinite loop behavior."""
+    pass
+
+
 # ---------------------------
 # SRT parsing / writing
 # ---------------------------
@@ -55,22 +60,18 @@ class SrtBlock:
 
 
 def _read_text_file(path: str) -> str:
-    # SRT often uses UTF-8 with BOM; sometimes UTF-16; occasionally legacy encodings.
     encodings = ["utf-8-sig", "utf-8", "utf-16", "cp1252"]
-    last_err: Optional[Exception] = None
     for enc in encodings:
         try:
             with open(path, "r", encoding=enc, errors="strict") as f:
                 return f.read()
-        except Exception as e:
-            last_err = e
-    # Last resort: lossy read
+        except Exception:
+            pass
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
 def parse_srt(content: str) -> List[SrtBlock]:
-    # Normalize newlines
     content = content.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not content.strip():
         return []
@@ -78,44 +79,35 @@ def parse_srt(content: str) -> List[SrtBlock]:
     chunks = re.split(r"\n\s*\n", content)
     blocks: List[SrtBlock] = []
 
-    for chunk_i, chunk in enumerate(chunks, start=1):
-        lines = [ln.rstrip("\n") for ln in chunk.split("\n")]
-        lines = [ln.rstrip() for ln in lines]
-
+    for chunk in chunks:
+        lines = [ln.rstrip() for ln in chunk.split("\n")]
         if len(lines) < 2:
             continue
 
-        # index line
         idx_line = lines[0].strip()
         try:
             idx = int(idx_line)
         except ValueError:
-            # Try to recover: sometimes missing index; treat as sequential
             idx = len(blocks) + 1
 
-        # timestamp line
         ts_line = lines[1].strip()
         if not _TS_LINE_RE.match(ts_line):
-            # Try to find timestamp line within chunk
             ts_pos = None
             for j, ln in enumerate(lines):
                 if _TS_LINE_RE.match(ln.strip()):
                     ts_pos = j
                     break
             if ts_pos is None:
-                # Skip unrecognized chunk
                 continue
             ts_line = lines[ts_pos].strip()
-            text_lines = [ln for ln in lines[ts_pos + 1 :] if ln != ""]
+            text_lines = [ln for ln in lines[ts_pos + 1:] if ln != ""]
         else:
             text_lines = [ln for ln in lines[2:] if ln != ""]
 
         blocks.append(SrtBlock(index=idx, ts_line=ts_line, text_lines=text_lines))
 
-    # Re-index sequentially for clean output
     for i, b in enumerate(blocks, start=1):
         b.index = i
-
     return blocks
 
 
@@ -125,7 +117,7 @@ def write_srt(blocks: List[SrtBlock]) -> str:
         out_lines.append(str(i))
         out_lines.append(b.ts_line)
         out_lines.extend(b.text_lines if b.text_lines else [""])
-        out_lines.append("")  # blank line between blocks
+        out_lines.append("")
     return "\n".join(out_lines).rstrip("\n") + "\n"
 
 
@@ -135,18 +127,12 @@ def write_srt(blocks: List[SrtBlock]) -> str:
 
 _TEXT_FIELD_RE = re.compile(r"text\s*=\s*(['\"])(.*?)\1", re.DOTALL)
 
+# Auto-detected streaming support (None = not yet tested)
+_streaming_available: Optional[bool] = None
+
 
 def extract_text_from_response(resp_text: str, resp_json: Optional[Dict[str, Any]]) -> str:
-    """
-    Try multiple formats:
-    - OpenAI-like: choices[0].message.content
-    - OpenAI completion-like: choices[0].text
-    - Simple JSON: text/content
-    - Plain: text='...'
-    - Otherwise: raw body
-    """
     if resp_json is not None:
-        # OpenAI chat completions style
         try:
             choices = resp_json.get("choices")
             if isinstance(choices, list) and choices:
@@ -158,8 +144,6 @@ def extract_text_from_response(resp_text: str, resp_json: Optional[Dict[str, Any
                     return c0["text"]
         except Exception:
             pass
-
-        # Common alternatives
         for k in ("text", "content", "output", "result"):
             v = resp_json.get(k)
             if isinstance(v, str):
@@ -168,8 +152,90 @@ def extract_text_from_response(resp_text: str, resp_json: Optional[Dict[str, Any
     m = _TEXT_FIELD_RE.search(resp_text)
     if m:
         return m.group(2)
-
     return resp_text.strip()
+
+
+def _detect_repetition(
+    buffer: str,
+    min_pattern_len: int = 10,
+    max_pattern_len: int = 80,
+    min_repeats: int = 5,
+) -> bool:
+    """Check if the tail of buffer contains a short pattern repeated many times."""
+    buf_len = len(buffer)
+    for plen in range(min_pattern_len, min(max_pattern_len + 1, buf_len // min_repeats + 1)):
+        tail_needed = plen * min_repeats
+        if tail_needed > buf_len:
+            continue
+        tail = buffer[-tail_needed:]
+        pattern = tail[:plen]
+        if pattern * min_repeats == tail:
+            return True
+    return False
+
+
+def _stream_with_loop_detection(
+    endpoint: str,
+    payload: Dict[str, Any],
+    timeout_s: int,
+    expected_output_len: int,
+) -> str:
+    """Stream SSE response, detecting infinite loops and runaway output."""
+    r = requests.post(
+        endpoint, json=payload,
+        timeout=(10, timeout_s),
+        stream=True,
+    )
+    r.raise_for_status()
+
+    collected: List[str] = []
+    buffer = ""
+    total_len = 0
+    last_check_len = 0
+
+    try:
+        for raw_line in r.iter_lines(decode_unicode=True):
+            if not raw_line or not raw_line.startswith("data: "):
+                continue
+            data_str = raw_line[len("data: "):]
+            if data_str.strip() == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            delta = ""
+            try:
+                delta = chunk["choices"][0]["delta"].get("content", "")
+            except (KeyError, IndexError, TypeError):
+                continue
+
+            if not delta:
+                continue
+
+            collected.append(delta)
+            total_len += len(delta)
+            buffer = (buffer + delta)[-500:]
+
+            # Check every ~200 chars
+            if total_len - last_check_len >= 200:
+                last_check_len = total_len
+
+                if _detect_repetition(buffer):
+                    raise LoopDetectedError(
+                        f"Repeating pattern detected after {total_len} chars"
+                    )
+
+                if expected_output_len > 0 and total_len > expected_output_len * 3:
+                    raise LoopDetectedError(
+                        f"Runaway output: {total_len} chars (expected ~{expected_output_len})"
+                    )
+    finally:
+        r.close()
+
+    return "".join(collected)
 
 
 def post_messages(
@@ -177,11 +243,31 @@ def post_messages(
     messages: List[Dict[str, str]],
     timeout_s: int,
     extra_payload: Optional[Dict[str, Any]] = None,
+    stream: bool = False,
+    expected_output_len: int = 0,
 ) -> str:
+    global _streaming_available
     payload: Dict[str, Any] = {"messages": messages}
     if extra_payload:
         payload.update(extra_payload)
 
+    # Streaming path
+    if stream and _streaming_available is not False:
+        stream_payload = {**payload, "stream": True}
+        try:
+            return _stream_with_loop_detection(
+                endpoint, stream_payload, timeout_s, expected_output_len
+            )
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code < 500:
+                _streaming_available = False
+                sys.stderr.write("[WARN] Streaming not supported by backend, falling back.\n")
+            else:
+                raise
+        except LoopDetectedError:
+            raise
+
+    # Non-streaming path
     r = requests.post(endpoint, json=payload, timeout=timeout_s)
     r.raise_for_status()
 
@@ -199,12 +285,10 @@ def post_messages(
 # Numbered I/O helpers
 # ---------------------------
 
-# Permissive: matches [N] text, [N]: text, [N]. text, etc.
 _NUMBERED_LINE_RE = re.compile(r"^\[(\d+)\][.:)\s]*\s*(.*)", re.MULTILINE)
 
 
 def format_numbered_input(lines: List[str], start_index: int = 1) -> str:
-    """Format lines as [N] text for the numbered I/O protocol."""
     parts = []
     for i, line in enumerate(lines, start=start_index):
         parts.append(f"[{i}] {line}")
@@ -214,15 +298,6 @@ def format_numbered_input(lines: List[str], start_index: int = 1) -> str:
 def parse_numbered_output(
     text: str, expected_count: int, start_index: int = 1
 ) -> Tuple[List[Optional[str]], List[int]]:
-    """
-    Parse numbered output like '[1] translated text'.
-
-    Returns:
-        (translations, missing_indices)
-        - translations: list of length expected_count, None for missing entries
-        - missing_indices: list of indices that were not found in the output
-    """
-    # Normalize line endings before parsing
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     found: Dict[int, str] = {}
     for m in _NUMBERED_LINE_RE.finditer(text):
@@ -254,20 +329,13 @@ def translate_lines_via_backend(
     extra_payload: Optional[Dict[str, Any]],
     retry: int,
     retry_sleep_s: float,
+    use_stream: bool = True,
 ) -> List[str]:
-    """
-    Translate all lines in a single request using numbered I/O.
-
-    The entire file is sent at once (modern LLMs have large enough context).
-    Uses a 2-tier strategy:
-      Tier 1: Parse numbered output — if all lines present, done.
-      Tier 2: If some lines missing, send targeted repair requests until complete.
-    """
+    """Translate all lines in a single request using numbered I/O with streaming."""
     if not lines:
         return []
 
-    def _call_backend(messages: List[Dict[str, str]]) -> str:
-        """Call backend with retry logic. Raises on total failure."""
+    def _call_backend(messages: List[Dict[str, str]], hint_len: int = 0) -> str:
         last_err: Optional[Exception] = None
         for attempt in range(1, retry + 2):
             try:
@@ -276,7 +344,16 @@ def translate_lines_via_backend(
                     messages=messages,
                     timeout_s=timeout_s,
                     extra_payload=extra_payload,
+                    stream=use_stream,
+                    expected_output_len=hint_len,
                 )
+            except LoopDetectedError as e:
+                last_err = e
+                sys.stderr.write(
+                    f"[LOOP] Attempt {attempt}/{retry + 1}: {e}. Retrying...\n"
+                )
+                if attempt <= retry:
+                    time.sleep(retry_sleep_s)
             except Exception as e:
                 last_err = e
                 sys.stderr.write(
@@ -288,28 +365,28 @@ def translate_lines_via_backend(
 
     sys.stderr.write(f"[INFO] Translating {len(lines)} lines in one request...\n")
 
-    # Tier 1: send all lines with numbered format
     numbered_input = format_numbered_input(lines, start_index=1)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prefix + numbered_input},
     ]
 
-    out_text = _call_backend(messages)
+    out_text = _call_backend(messages, hint_len=len(numbered_input))
     translations, missing = parse_numbered_output(out_text, len(lines), start_index=1)
 
     if not missing:
         sys.stderr.write(f"[OK] All {len(lines)} lines translated.\n")
         return [t or "" for t in translations]
 
-    # Tier 2: repair missing lines (up to 3 rounds)
+    # Repair missing lines (up to 3 rounds)
     max_repair_rounds = 3
     for round_num in range(1, max_repair_rounds + 1):
         sys.stderr.write(
-            f"[REPAIR] Round {round_num}: {len(missing)}/{len(lines)} lines missing {missing}. "
+            f"[REPAIR] Round {round_num}: {len(missing)}/{len(lines)} lines missing. "
             f"Sending repair request...\n"
         )
         repair_lines = [f"[{i}] {lines[i - 1]}" for i in missing]
+        repair_input = "\n".join(repair_lines)
         repair_messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -317,13 +394,13 @@ def translate_lines_via_backend(
                 "content": (
                     "The following lines were missing from your previous output. "
                     "Translate ONLY these lines, keeping the [N] format:\n"
-                    + "\n".join(repair_lines)
+                    + repair_input
                 ),
             },
         ]
 
         try:
-            repair_text = _call_backend(repair_messages)
+            repair_text = _call_backend(repair_messages, hint_len=len(repair_input))
             for m in _NUMBERED_LINE_RE.finditer(repair_text):
                 num = int(m.group(1))
                 if 1 <= num <= len(lines) and translations[num - 1] is None:
@@ -346,15 +423,10 @@ def translate_lines_via_backend(
 
 
 def build_line_mapping(blocks: List[SrtBlock]) -> Tuple[List[str], List[Tuple[int, int]]]:
-    """
-    Flatten all subtitle text lines into a list for translation,
-    and keep a back-reference: (block_index_in_list, line_index_in_block)
-    """
     lines: List[str] = []
     refs: List[Tuple[int, int]] = []
     for bi, b in enumerate(blocks):
         if not b.text_lines:
-            # keep empty line to preserve structure
             lines.append("")
             refs.append((bi, 0))
         else:
@@ -367,18 +439,176 @@ def build_line_mapping(blocks: List[SrtBlock]) -> Tuple[List[str], List[Tuple[in
 def apply_translations(blocks: List[SrtBlock], refs: List[Tuple[int, int]], translated_lines: List[str]) -> None:
     if len(refs) != len(translated_lines):
         raise ValueError(f"Internal error: refs={len(refs)} translated_lines={len(translated_lines)}")
-
-    # Prepare structure if some blocks originally had no lines
     for b in blocks:
         if not b.text_lines:
             b.text_lines = [""]
-
     for (bi, li), tln in zip(refs, translated_lines):
         b = blocks[bi]
-        # Safety: extend if needed
         if li >= len(b.text_lines):
             b.text_lines.extend([""] * (li - len(b.text_lines) + 1))
         b.text_lines[li] = tln
+
+
+# ---------------------------
+# Series grouping
+# ---------------------------
+
+def group_files_by_series(
+    file_paths: List[str],
+    endpoint: str,
+    timeout_s: int,
+    extra_payload: Optional[Dict[str, Any]],
+) -> List[Tuple[str, List[str]]]:
+    """Use the LLM to group subtitle files by series and sort by episode order."""
+    if len(file_paths) <= 2:
+        return [("All", file_paths)]
+
+    # Build basename-to-path lookup (handle duplicate basenames)
+    basenames = [os.path.basename(p) for p in file_paths]
+    has_dupes = len(set(basenames)) < len(basenames)
+
+    if has_dupes:
+        # Use relative paths from common ancestor
+        common = os.path.commonpath(file_paths)
+        display_names = [os.path.relpath(p, common) for p in file_paths]
+    else:
+        display_names = basenames
+
+    name_to_path: Dict[str, str] = {}
+    for display, full in zip(display_names, file_paths):
+        name_to_path[display] = full
+
+    file_list_text = "\n".join(display_names)
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a file organizer. Given subtitle filenames, group them "
+                "by TV series / movie and sort each group by episode order.\n\n"
+                "Return ONLY valid JSON in this exact format, no commentary:\n"
+                '{"groups": [\n'
+                '  {"series": "Series Name", "files": ["file1.srt", "file2.srt"]},\n'
+                '  {"series": "Series Name 2", "files": ["file3.srt"]}\n'
+                "]}\n\n"
+                "Rules:\n"
+                "- Every input filename must appear in exactly one group.\n"
+                "- Sort files within each group by episode number.\n"
+                '- If you cannot determine the series, put those files in a group named "Unknown".\n'
+                "- Output raw JSON only. No markdown fences, no explanation."
+            ),
+        },
+        {"role": "user", "content": f"Filenames:\n{file_list_text}"},
+    ]
+
+    try:
+        sys.stderr.write(f"[INFO] Grouping {len(file_paths)} files by series...\n")
+        raw = post_messages(
+            endpoint=endpoint,
+            messages=messages,
+            timeout_s=min(timeout_s, 60),
+            extra_payload=extra_payload,
+            stream=False,
+        )
+
+        # Strip markdown fences if present
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not json_match:
+            raise ValueError("No JSON object found in response")
+        result = json.loads(json_match.group())
+
+        groups_data = result.get("groups")
+        if not isinstance(groups_data, list):
+            raise ValueError("'groups' is not a list")
+
+        groups: List[Tuple[str, List[str]]] = []
+        matched: set = set()
+
+        for g in groups_data:
+            series = g.get("series", "Unknown")
+            files = g.get("files", [])
+            if not isinstance(files, list):
+                continue
+            paths_in_group: List[str] = []
+            for f in files:
+                f_str = str(f)
+                if f_str in name_to_path and f_str not in matched:
+                    paths_in_group.append(name_to_path[f_str])
+                    matched.add(f_str)
+            if paths_in_group:
+                groups.append((str(series), paths_in_group))
+
+        # Catch-all for unmatched files
+        unmatched = [p for d, p in name_to_path.items() if d not in matched]
+        if unmatched:
+            groups.append(("Unknown", unmatched))
+
+        # Log grouping results
+        for series, paths in groups:
+            sys.stderr.write(f"[GROUP] \"{series}\" ({len(paths)} files)\n")
+
+        return groups
+
+    except Exception as e:
+        sys.stderr.write(f"[WARN] Series grouping failed: {e}. Treating all files as one group.\n")
+        return [("All", file_paths)]
+
+
+def extract_glossary(
+    source_lines: List[str],
+    translated_lines: List[str],
+    endpoint: str,
+    timeout_s: int,
+    extra_payload: Optional[Dict[str, Any]],
+    existing_glossary: str,
+) -> str:
+    """Extract character names and key terms from a translated episode."""
+    # Sample first 50 + last 50 lines to stay compact
+    def _sample(lines: List[str], n: int = 50) -> str:
+        if len(lines) <= n * 2:
+            return "\n".join(lines)
+        return "\n".join(lines[:n] + ["..."] + lines[-n:])
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a translation glossary extractor. Given subtitle lines "
+                "(source and translation), extract character names and key terms.\n\n"
+                "Output format (one per line):\n"
+                "SourceTerm → TranslatedTerm\n\n"
+                "Rules:\n"
+                "- Include character names, place names, and recurring proper nouns only.\n"
+                "- Maximum 50 entries.\n"
+                "- If a previous glossary is provided, merge with it (keep latest translation for conflicts).\n"
+                "- Output ONLY glossary lines, no commentary."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Previous glossary:\n{existing_glossary or '(none)'}\n\n"
+                f"Source lines (sample):\n{_sample(source_lines)}\n\n"
+                f"Translated lines (sample):\n{_sample(translated_lines)}"
+            ),
+        },
+    ]
+
+    try:
+        raw = post_messages(
+            endpoint=endpoint,
+            messages=messages,
+            timeout_s=min(timeout_s, 60),
+            extra_payload=extra_payload,
+            stream=False,
+        )
+        # Basic validation: should have at least one → symbol
+        if "→" in raw or "->" in raw:
+            return raw.strip()
+        return existing_glossary
+    except Exception as e:
+        sys.stderr.write(f"[WARN] Glossary extraction failed: {e}\n")
+        return existing_glossary
 
 
 # ---------------------------
@@ -404,7 +634,6 @@ _DEFAULT_USER_PREFIX = "Translate the following {source_lang} subtitles to {targ
 
 
 def _format_template(template: str, source_lang: str, target_lang: str) -> str:
-    """Format a prompt template, returning it unchanged if placeholders are absent."""
     try:
         return template.format(source_lang=source_lang, target_lang=target_lang)
     except (KeyError, IndexError):
@@ -414,15 +643,26 @@ def _format_template(template: str, source_lang: str, target_lang: str) -> str:
 def expand_inputs(inputs: List[str]) -> List[str]:
     paths: List[str] = []
     for it in inputs:
-        # Allow glob patterns
         if any(ch in it for ch in "*?[]"):
             paths.extend(glob.glob(it))
         else:
             paths.append(it)
-    # De-dup, keep order
-    seen = set()
-    out = []
+
+    # Expand directories into .srt files recursively
+    expanded: List[str] = []
     for p in paths:
+        if os.path.isdir(p):
+            for root, _dirs, files in os.walk(p):
+                for f in sorted(files):
+                    if f.lower().endswith(".srt"):
+                        expanded.append(os.path.join(root, f))
+        else:
+            expanded.append(p)
+
+    # De-dup, keep order
+    seen: set = set()
+    out: List[str] = []
+    for p in expanded:
         ap = os.path.abspath(p)
         if ap not in seen and os.path.isfile(ap):
             seen.add(ap)
@@ -432,12 +672,12 @@ def expand_inputs(inputs: List[str]) -> List[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Translate .srt subtitle files via a backend API, with ASR error correction."
+        description="Translate .srt subtitle files via a backend API, with ASR error correction and series grouping."
     )
     ap.add_argument(
         "inputs",
         nargs="+",
-        help="Input .srt files or glob patterns (e.g. subs/*.srt)",
+        help="Input .srt files, directories, or glob patterns (e.g. subs/ subs/*.srt movie.srt)",
     )
     ap.add_argument(
         "--endpoint",
@@ -473,8 +713,8 @@ def main() -> int:
     ap.add_argument(
         "--retry",
         type=int,
-        default=1,
-        help="Retry count per chunk on failure (default: 1)",
+        default=2,
+        help="Retry count on failure (default: 2)",
     )
     ap.add_argument(
         "--retry-sleep",
@@ -490,24 +730,35 @@ def main() -> int:
     ap.add_argument(
         "--user-prefix",
         default=_DEFAULT_USER_PREFIX,
-        help="User message prefix before text (supports {source_lang} and {target_lang} placeholders)",
+        help="User message prefix (supports {source_lang} and {target_lang} placeholders)",
     )
     ap.add_argument(
         "--extra-payload",
         default="",
-        help="Extra JSON fields to include in POST body (e.g. '{\"model\":\"local\",\"temperature\":0}')",
+        help="Extra JSON fields for POST body (e.g. '{\"model\":\"local\",\"temperature\":0}')",
+    )
+    ap.add_argument(
+        "--no-group",
+        action="store_true",
+        default=False,
+        help="Disable automatic series grouping (treat all files independently)",
+    )
+    ap.add_argument(
+        "--no-stream",
+        action="store_true",
+        default=False,
+        help="Disable streaming mode (no loop detection, use blocking requests)",
     )
 
     args = ap.parse_args()
 
     input_paths = expand_inputs(args.inputs)
     if not input_paths:
-        print("ERROR: No valid input files found.", file=sys.stderr)
+        print("ERROR: No valid .srt files found.", file=sys.stderr)
         return 2
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Format prompt templates with language names
     system_prompt = _format_template(args.system_prompt, args.source_lang, args.target_lang)
     user_prefix = _format_template(args.user_prefix, args.source_lang, args.target_lang)
 
@@ -521,42 +772,77 @@ def main() -> int:
             print(f"ERROR: --extra-payload is not valid JSON object: {e}", file=sys.stderr)
             return 2
 
-    for path in input_paths:
-        base = os.path.basename(path)
-        stem, _ext = os.path.splitext(base)
-        out_path = os.path.join(args.out_dir, stem + args.suffix)
+    use_stream = not args.no_stream
 
-        print(f"[INFO] Processing: {path}")
-        content = _read_text_file(path)
-        blocks = parse_srt(content)
-
-        if not blocks:
-            print(f"[WARN] No blocks parsed from: {path}. Writing empty output.")
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write("")
-            continue
-
-        flat_lines, refs = build_line_mapping(blocks)
-
-        # Translate
-        translated_lines = translate_lines_via_backend(
-            lines=flat_lines,
-            endpoint=args.endpoint,
-            timeout_s=args.timeout,
-            system_prompt=system_prompt,
-            user_prefix=user_prefix,
-            extra_payload=extra_payload,
-            retry=args.retry,
-            retry_sleep_s=args.retry_sleep,
+    # Group files by series
+    if args.no_group:
+        groups: List[Tuple[str, List[str]]] = [("All", input_paths)]
+    else:
+        groups = group_files_by_series(
+            input_paths, args.endpoint, args.timeout, extra_payload
         )
 
-        apply_translations(blocks, refs, translated_lines)
+    for group_idx, (series_name, group_paths) in enumerate(groups, 1):
+        if len(groups) > 1:
+            print(f"\n[SERIES {group_idx}/{len(groups)}] \"{series_name}\" ({len(group_paths)} files)")
 
-        out_srt = write_srt(blocks)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(out_srt)
+        glossary = ""  # Reset per series
 
-        print(f"[INFO] Wrote: {out_path}")
+        for file_idx, path in enumerate(group_paths):
+            base = os.path.basename(path)
+            stem, _ext = os.path.splitext(base)
+            out_path = os.path.join(args.out_dir, stem + args.suffix)
+
+            print(f"[INFO] Processing: {path}")
+            content = _read_text_file(path)
+            blocks = parse_srt(content)
+
+            if not blocks:
+                print(f"[WARN] No blocks parsed from: {path}. Writing empty output.")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write("")
+                continue
+
+            flat_lines, refs = build_line_mapping(blocks)
+
+            # Build augmented prompt with glossary
+            aug_prompt = system_prompt
+            if glossary:
+                aug_prompt += (
+                    "\n\n---\n"
+                    "Glossary from previous episodes in this series "
+                    "(use these translations consistently):\n"
+                    + glossary
+                )
+
+            translated_lines = translate_lines_via_backend(
+                lines=flat_lines,
+                endpoint=args.endpoint,
+                timeout_s=args.timeout,
+                system_prompt=aug_prompt,
+                user_prefix=user_prefix,
+                extra_payload=extra_payload,
+                retry=args.retry,
+                retry_sleep_s=args.retry_sleep,
+                use_stream=use_stream,
+            )
+
+            apply_translations(blocks, refs, translated_lines)
+
+            out_srt = write_srt(blocks)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(out_srt)
+
+            print(f"[INFO] Wrote: {out_path}")
+
+            # Extract glossary for next episode in this series
+            if len(group_paths) > 1 and file_idx < len(group_paths) - 1:
+                sys.stderr.write("[INFO] Extracting glossary for next episode...\n")
+                glossary = extract_glossary(
+                    flat_lines, translated_lines,
+                    args.endpoint, args.timeout,
+                    extra_payload, glossary,
+                )
 
     return 0
 

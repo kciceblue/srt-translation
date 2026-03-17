@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ── Configuration (edit these) ───────────────────────────────────────
-ENDPOINT="http://127.0.0.1:5000/v1/chat/completions"
-INPUT="subs/*.srt"
+ENDPOINT="http://127.0.0.1:8089/v1/chat/completions"
+INPUT="subs/"
 OUT_DIR="out"
 SOURCE_LANG="Japanese"
 TARGET_LANG="Simplified Chinese"
-EXTRA='{"model":"qwen3.5-35b","temperature":0}'
+EXTRA='{"model":"local/qwen3.5","temperature":0.6}'
 # ─────────────────────────────────────────────────────────────────────
 
 python3 main.py "$INPUT" \
