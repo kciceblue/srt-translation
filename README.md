@@ -64,7 +64,7 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 | `--no-group` | false | Disable series grouping |
 | `--no-stream` | false | Disable streaming |
 | `--verbose` / `-v` | false | Show detailed progress and stream LLM responses to stdout |
-| `--proofread` | false | Enable proofread pass after translation |
+| `--proofread` | false | Proofread mode: skip translation, proofread existing translated files using vocab |
 | `--vocab` | vocab.txt | Vocabulary file — loaded at startup, updated with learnt terms after each run. Set to `''` to disable. |
 
 ## How It Works
@@ -78,10 +78,27 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 When given multiple files, the tool asks the LLM to group them by series (based on filenames). Files in the same series are translated in episode order with a shared **glossary** of character names and key terms, ensuring consistent naming across episodes. The glossary resets between different series. Use `--no-group` to disable.
 
 ### Persistent Vocabulary
-A vocabulary file (`vocab.txt` by default) is loaded at startup and updated with learnt terms after each translation run. The file uses a simple `SourceTerm → TranslatedTerm` format and can be edited freely between runs. Change the path with `--vocab`, or set `--vocab ''` to disable. Vocabulary is also fed into the translation glossary and proofread prompt for consistent naming.
+A vocabulary file (`vocab.txt` by default) is loaded at startup and updated with learnt terms after each translation run. Entries support two formats:
+- `SourceTerm → TranslatedTerm` — source language to target language mapping
+- `DraftTranslation → Corrected` — fix a specific draft translation
 
-### Proofread Pass
-When `--proofread` is enabled, after all files in a series are translated, a second pass reviews each file's source+translation pairs with the full vocabulary context (`--vocab` file + LLM-learnt glossary from the series). The proofreader fixes `??`-flagged lines, inconsistent names, and mistranslations. If proofread fails for a file, the original translation is kept.
+Change the path with `--vocab`, or set `--vocab ''` to disable. Vocabulary is fed into the translation glossary and proofread prompt for consistent naming.
+
+### Two-Step Workflow (Translate → Review → Proofread)
+
+Proofread runs as a **separate invocation** so you can review and curate the auto-generated vocabulary between steps:
+
+```bash
+# Step 1: Translate (saves learnt vocab to vocab.txt)
+python main.py subs/ --endpoint http://... --out-dir out
+
+# Step 2: Review/edit vocab.txt — remove bad entries, fix translations, add custom terms
+
+# Step 3: Proofread (reads existing translations from out-dir, thinking enabled)
+python main.py subs/ --proofread --endpoint http://... --out-dir out
+```
+
+When `--proofread` is specified, the tool **does not translate**. It finds each input file's corresponding translated file in `--out-dir` (using `stem + suffix`), reads both source and translated SRT, proofreads with vocabulary context and thinking enabled, then overwrites the translated file. If a translated file is not found, it warns and skips. If proofread fails for a file, the original translation is kept.
 
 ### Runaway Detection
 Uses SSE streaming to monitor output length. If content output exceeds 3x the expected length, the stream is closed and the collected output is truncated at the first repeating pattern (keeping 2 occurrences). The partial result is used and translation continues to the next chunk. Use `--no-stream` to disable streaming.

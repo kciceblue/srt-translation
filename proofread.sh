@@ -11,6 +11,7 @@ EXTRA='{"model":"local/qwen3.5","temperature":0.2}'
 # ─────────────────────────────────────────────────────────────────────
 
 python3 main.py "$INPUT" \
+  --proofread \
   --endpoint "$ENDPOINT" \
   --out-dir "$OUT_DIR" \
   --source-lang "$SOURCE_LANG" \

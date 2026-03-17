@@ -32,7 +32,7 @@ Everything lives in `main.py` with seven logical sections:
 
 1. **SRT parsing/writing** — `parse_srt()` / `write_srt()` / `SrtBlock` dataclass. Handles encoding detection (UTF-8 BOM, UTF-16, CP1252 fallback) and tolerant parsing of malformed SRT files.
 
-2. **Backend interaction** — `post_messages()` with dual-mode: non-streaming (blocking) and SSE streaming. `_stream_with_loop_detection()` monitors content length and truncates at repetition on runaway. `_truncate_at_repetition()` cleans up looped output keeping first 2 occurrences. Thinking is disabled globally (`enable_thinking: false`). Auto-falls back to non-streaming if backend doesn't support it.
+2. **Backend interaction** — `post_messages()` with dual-mode: non-streaming (blocking) and SSE streaming. `_stream_with_loop_detection()` monitors content length and truncates at repetition on runaway. `_truncate_at_repetition()` cleans up looped output keeping first 2 occurrences. Thinking disabled by default (`enable_thinking` parameter), enabled during proofread. Auto-falls back to non-streaming if backend doesn't support it.
 
 3. **Numbered I/O helpers** — `format_numbered_input()` / `parse_numbered_output()`. Explicit `[N] text` anchors for robust line mapping.
 
@@ -40,9 +40,9 @@ Everything lives in `main.py` with seven logical sections:
 
 5. **Series grouping** — `group_files_by_series()` sends filenames to the LLM to group by series and sort by episode order. `extract_glossary()` builds a rolling glossary of character names/terms from each translated episode. Glossary resets between series.
 
-6. **Proofread pass** — `proofread_file()` reviews source+translation pairs with vocabulary context. Sends side-by-side `[N] source → translation` pairs to the LLM. Fixes `??` markers, inconsistent names, and mistranslations. Falls back to original translation on failure. Opt-in via `--proofread`. User vocabulary loaded from `--vocab` file, merged with series glossary.
+6. **Proofread pass** — `proofread_file()` reviews source+translation pairs with vocabulary context and thinking enabled. Sends side-by-side `[N] source → translation` pairs to the LLM. Fixes `??` markers, inconsistent names, and mistranslations. Falls back to original translation on failure. Runs as a **separate invocation** via `--proofread` (does not translate). Vocab entries support both `source→target` and `draft→corrected` formats.
 
-7. **CLI** — `main()` with argparse. Accepts files, directories, and globs. Key flags: `--endpoint`, `--source-lang`/`--target-lang`, `--chunk-size`, `--repetition-penalty`, `--no-group`, `--no-stream`, `--verbose`, `--extra-payload`, `--suffix`, `--out-dir`, `--retry`, `--proofread`, `--vocab`.
+7. **CLI** — `main()` with argparse. Two modes: **translation** (default) and **proofread** (`--proofread`). Translation mode translates files, extracts glossary, saves vocab. Proofread mode reads existing translated files from `--out-dir`, proofreads with vocab, overwrites. Key flags: `--endpoint`, `--source-lang`/`--target-lang`, `--chunk-size`, `--repetition-penalty`, `--no-group`, `--no-stream`, `--verbose`, `--extra-payload`, `--suffix`, `--out-dir`, `--retry`, `--proofread`, `--vocab`.
 
 ## Key Design Decisions
 
@@ -51,5 +51,5 @@ Everything lives in `main.py` with seven logical sections:
 - **Numbered line protocol**: `[N] text` format with regex parsing. Missing lines detected by number, not position.
 - **Runaway handling**: If content output exceeds 3x expected, stream is closed and output is truncated at the first repeating pattern (keeping 2 occurrences). No retries — partial result is used and next chunk proceeds.
 - **Series context sharing**: LLM groups files by series from filenames. Glossary accumulated per episode, appended to system prompt for next episode, reset between series.
-- **Proofread pass**: Opt-in second pass (`--proofread`) runs after all files in a series are translated. Reviews full source+translation pairs with merged vocabulary (user `--vocab` + learnt glossary). Sends entire file in one request. Falls back to original translation on failure.
+- **Decoupled proofread**: `--proofread` is a separate mode (not combined with translation). User translates first, reviews/edits `vocab.txt`, then runs proofread separately. Proofread enables thinking for deeper reasoning. Vocab supports both `source→target` and `draft→corrected` entry formats.
 - **`subs/`** is the conventional input directory; **`out/`** is the conventional output directory.
