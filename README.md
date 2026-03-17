@@ -1,5 +1,7 @@
 # SRT Translator
 
+[中文文档](README_CN.md)
+
 Translate subtitle files via backend API while preserving timestamps and line structure. Fixes ASR/Whisper transcription errors using context.
 
 ## Setup
@@ -78,3 +80,7 @@ python main.py subs/drama.srt \
 ## Dependencies
 
 - requests
+
+## License
+
+[MIT](LICENSE)
