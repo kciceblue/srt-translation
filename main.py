@@ -182,8 +182,10 @@ def _stream_with_loop_detection(
     expected_output_len: int,
     verbose: bool = False,
     max_thinking_len: int = 0,
+    runaway_multiplier: float = 3.0,
+    raise_on_runaway: bool = False,
 ) -> str:
-    """Stream SSE response. On runaway, truncate and return partial result."""
+    """Stream SSE response. On runaway, truncate and return partial result (or raise if raise_on_runaway)."""
     r = requests.post(
         endpoint, json=payload,
         timeout=(10, timeout_s),
@@ -248,7 +250,8 @@ def _stream_with_loop_detection(
                 total_content_len += len(delta)
 
             # Runaway: stop collecting, close connection
-            if expected_output_len > 0 and total_content_len > expected_output_len * 3:
+            if (runaway_multiplier > 0 and expected_output_len > 0
+                    and total_content_len > expected_output_len * runaway_multiplier):
                 runaway = True
                 break
     finally:
@@ -260,9 +263,14 @@ def _stream_with_loop_detection(
     raw_output = "".join(collected)
     if runaway:
         sys.stderr.write(
-            f"[RUNAWAY] Content output {total_content_len} chars exceeded 3x expected "
-            f"(~{expected_output_len}). Truncating at repetition...\n"
+            f"[RUNAWAY] Content output {total_content_len} chars exceeded {runaway_multiplier}x expected "
+            f"(~{expected_output_len}).\n"
         )
+        if raise_on_runaway:
+            raise RuntimeError(
+                f"Runaway detected: {total_content_len} chars exceeded "
+                f"{runaway_multiplier}x expected (~{expected_output_len})"
+            )
         cleaned = _truncate_at_repetition(raw_output)
         sys.stderr.write(
             f"[RUNAWAY] Kept {len(cleaned)}/{len(raw_output)} chars after cleanup.\n"
@@ -283,6 +291,8 @@ def post_messages(
     override_params: Optional[Dict[str, Any]] = None,
     enable_thinking: bool = False,
     max_thinking_len: int = 0,
+    runaway_multiplier: float = 3.0,
+    raise_on_runaway: bool = False,
 ) -> str:
     global _streaming_available
     payload: Dict[str, Any] = {"messages": messages}
@@ -304,6 +314,8 @@ def post_messages(
                 endpoint, stream_payload, timeout_s, expected_output_len,
                 verbose=verbose,
                 max_thinking_len=max_thinking_len,
+                runaway_multiplier=runaway_multiplier,
+                raise_on_runaway=raise_on_runaway,
             )
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code < 500:
