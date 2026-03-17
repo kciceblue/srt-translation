@@ -59,6 +59,7 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 | `--extra-payload` | "" | API 请求体的额外 JSON 字段 |
 | `--no-group` | false | 禁用系列自动分组 |
 | `--no-stream` | false | 禁用流式传输（关闭循环检测） |
+| `--verbose` / `-v` | false | 显示详细进度并将 LLM 流式回复输出到 stderr |
 
 ## 工作原理
 

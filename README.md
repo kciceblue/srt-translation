@@ -61,6 +61,7 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 | `--extra-payload` | "" | Extra JSON fields for API body |
 | `--no-group` | false | Disable series grouping |
 | `--no-stream` | false | Disable streaming (no loop detection) |
+| `--verbose` / `-v` | false | Show detailed progress and stream LLM responses to stderr |
 
 ## How It Works
 

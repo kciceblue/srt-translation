@@ -179,6 +179,7 @@ def _stream_with_loop_detection(
     payload: Dict[str, Any],
     timeout_s: int,
     expected_output_len: int,
+    verbose: bool = False,
 ) -> str:
     """Stream SSE response, detecting infinite loops and runaway output."""
     r = requests.post(
@@ -215,6 +216,10 @@ def _stream_with_loop_detection(
             if not delta:
                 continue
 
+            if verbose:
+                sys.stderr.write(delta)
+                sys.stderr.flush()
+
             collected.append(delta)
             total_len += len(delta)
             buffer = (buffer + delta)[-500:]
@@ -233,6 +238,8 @@ def _stream_with_loop_detection(
                         f"Runaway output: {total_len} chars (expected ~{expected_output_len})"
                     )
     finally:
+        if verbose and collected:
+            sys.stderr.write("\n")
         r.close()
 
     return "".join(collected)
@@ -245,18 +252,24 @@ def post_messages(
     extra_payload: Optional[Dict[str, Any]] = None,
     stream: bool = False,
     expected_output_len: int = 0,
+    verbose: bool = False,
 ) -> str:
     global _streaming_available
     payload: Dict[str, Any] = {"messages": messages}
     if extra_payload:
         payload.update(extra_payload)
 
+    if verbose:
+        msg_lens = ", ".join(f"{m['role']}:{len(m['content'])}ch" for m in messages)
+        sys.stderr.write(f"  [POST] {endpoint} stream={stream} ({msg_lens})\n")
+
     # Streaming path
     if stream and _streaming_available is not False:
         stream_payload = {**payload, "stream": True}
         try:
             return _stream_with_loop_detection(
-                endpoint, stream_payload, timeout_s, expected_output_len
+                endpoint, stream_payload, timeout_s, expected_output_len,
+                verbose=verbose,
             )
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code < 500:
@@ -330,6 +343,7 @@ def translate_lines_via_backend(
     retry: int,
     retry_sleep_s: float,
     use_stream: bool = True,
+    verbose: bool = False,
 ) -> List[str]:
     """Translate all lines in a single request using numbered I/O with streaming."""
     if not lines:
@@ -338,6 +352,8 @@ def translate_lines_via_backend(
     def _call_backend(messages: List[Dict[str, str]], hint_len: int = 0) -> str:
         last_err: Optional[Exception] = None
         for attempt in range(1, retry + 2):
+            if verbose:
+                sys.stderr.write(f"  [CALL] Attempt {attempt}/{retry + 1}, hint_len={hint_len}\n")
             try:
                 return post_messages(
                     endpoint=endpoint,
@@ -346,6 +362,7 @@ def translate_lines_via_backend(
                     extra_payload=extra_payload,
                     stream=use_stream,
                     expected_output_len=hint_len,
+                    verbose=verbose,
                 )
             except LoopDetectedError as e:
                 last_err = e
@@ -364,6 +381,11 @@ def translate_lines_via_backend(
         raise RuntimeError(f"Backend failed after {retry + 1} attempts: {last_err}")
 
     sys.stderr.write(f"[INFO] Translating {len(lines)} lines in one request...\n")
+
+    if verbose:
+        sys.stderr.write(f"  [DETAIL] System prompt length: {len(system_prompt)} chars\n")
+        preview = lines[:3]
+        sys.stderr.write(f"  [DETAIL] First lines: {preview}\n")
 
     numbered_input = format_numbered_input(lines, start_index=1)
     messages = [
@@ -458,6 +480,7 @@ def group_files_by_series(
     endpoint: str,
     timeout_s: int,
     extra_payload: Optional[Dict[str, Any]],
+    verbose: bool = False,
 ) -> List[Tuple[str, List[str]]]:
     """Use the LLM to group subtitle files by series and sort by episode order."""
     if len(file_paths) <= 2:
@@ -503,13 +526,20 @@ def group_files_by_series(
 
     try:
         sys.stderr.write(f"[INFO] Grouping {len(file_paths)} files by series...\n")
+        if verbose:
+            sys.stderr.write(f"  [DETAIL] Files to group:\n")
+            for dn in display_names:
+                sys.stderr.write(f"    {dn}\n")
         raw = post_messages(
             endpoint=endpoint,
             messages=messages,
             timeout_s=min(timeout_s, 60),
             extra_payload=extra_payload,
             stream=False,
+            verbose=verbose,
         )
+        if verbose:
+            sys.stderr.write(f"  [DETAIL] Grouping response: {raw[:500]}\n")
 
         # Strip markdown fences if present
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -561,6 +591,7 @@ def extract_glossary(
     timeout_s: int,
     extra_payload: Optional[Dict[str, Any]],
     existing_glossary: str,
+    verbose: bool = False,
 ) -> str:
     """Extract character names and key terms from a translated episode."""
     # Sample first 50 + last 50 lines to stay compact
@@ -601,9 +632,12 @@ def extract_glossary(
             timeout_s=min(timeout_s, 60),
             extra_payload=extra_payload,
             stream=False,
+            verbose=verbose,
         )
         # Basic validation: should have at least one → symbol
         if "→" in raw or "->" in raw:
+            if verbose:
+                sys.stderr.write(f"  [DETAIL] Glossary extracted ({raw.count(chr(10)) + 1} entries)\n")
             return raw.strip()
         return existing_glossary
     except Exception as e:
@@ -749,6 +783,12 @@ def main() -> int:
         default=False,
         help="Disable streaming mode (no loop detection, use blocking requests)",
     )
+    ap.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Show detailed progress and stream LLM responses to stderr",
+    )
 
     args = ap.parse_args()
 
@@ -773,13 +813,15 @@ def main() -> int:
             return 2
 
     use_stream = not args.no_stream
+    verbose = args.verbose
 
     # Group files by series
     if args.no_group:
         groups: List[Tuple[str, List[str]]] = [("All", input_paths)]
     else:
         groups = group_files_by_series(
-            input_paths, args.endpoint, args.timeout, extra_payload
+            input_paths, args.endpoint, args.timeout, extra_payload,
+            verbose=verbose,
         )
 
     for group_idx, (series_name, group_paths) in enumerate(groups, 1):
@@ -814,6 +856,11 @@ def main() -> int:
                     "(use these translations consistently):\n"
                     + glossary
                 )
+                if verbose:
+                    sys.stderr.write(f"  [DETAIL] Glossary appended ({glossary.count(chr(10)) + 1} entries, {len(glossary)} chars)\n")
+
+            if verbose:
+                sys.stderr.write(f"  [DETAIL] {len(flat_lines)} text lines, {len(blocks)} SRT blocks\n")
 
             translated_lines = translate_lines_via_backend(
                 lines=flat_lines,
@@ -825,6 +872,7 @@ def main() -> int:
                 retry=args.retry,
                 retry_sleep_s=args.retry_sleep,
                 use_stream=use_stream,
+                verbose=verbose,
             )
 
             apply_translations(blocks, refs, translated_lines)
@@ -842,6 +890,7 @@ def main() -> int:
                     flat_lines, translated_lines,
                     args.endpoint, args.timeout,
                     extra_payload, glossary,
+                    verbose=verbose,
                 )
 
     return 0

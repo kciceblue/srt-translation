@@ -15,4 +15,5 @@ python3 main.py "$INPUT" \
   --out-dir "$OUT_DIR" \
   --source-lang "$SOURCE_LANG" \
   --target-lang "$TARGET_LANG" \
-  --extra-payload "$EXTRA"
+  --extra-payload "$EXTRA" \
+  --verbose
