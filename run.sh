@@ -7,7 +7,7 @@ INPUT="subs/"
 OUT_DIR="out"
 SOURCE_LANG="Japanese"
 TARGET_LANG="Simplified Chinese"
-EXTRA='{"model":"local/qwen3.5","temperature":0.6}'
+EXTRA='{"model":"local/qwen3.5","temperature":0.3}'
 # ─────────────────────────────────────────────────────────────────────
 
 python3 main.py "$INPUT" \

@@ -77,6 +77,14 @@ When given multiple files, the tool asks the LLM to group them by series (based 
 ### Loop Detection
 Uses SSE streaming to detect when the model gets stuck in an infinite loop (repeating the same pattern). On detection, the connection is closed immediately and the request is retried. Use `--no-stream` to disable.
 
+## Recommended Temperature
+
+Use **temperature 0.3** via `--extra-payload '{"temperature":0.3}'`.
+
+- **Not 0**: The model needs some flexibility to infer and correct Whisper transcription errors from context. Strictly deterministic output tends to translate garbled words literally.
+- **Not 0.6+**: Higher temperature increases hallucination risk, inconsistent character names, format deviations (triggering more repair rounds), and is more likely to trigger infinite loops.
+- **0.2** if the model still loops occasionally; **0.4** if ASR corrections feel too conservative.
+
 ## Troubleshooting
 
 **Missing lines in output**: Auto-repaired in up to 3 rounds
