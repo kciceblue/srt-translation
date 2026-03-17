@@ -38,10 +38,6 @@ except ImportError:
     sys.exit(2)
 
 
-class LoopDetectedError(RuntimeError):
-    """Raised when streaming response exhibits infinite loop behavior."""
-    pass
-
 
 # ---------------------------
 # SRT parsing / writing
@@ -155,23 +151,28 @@ def extract_text_from_response(resp_text: str, resp_json: Optional[Dict[str, Any
     return resp_text.strip()
 
 
-def _detect_repetition(
-    buffer: str,
-    min_pattern_len: int = 10,
-    max_pattern_len: int = 80,
-    min_repeats: int = 5,
-) -> bool:
-    """Check if the tail of buffer contains a short pattern repeated many times."""
-    buf_len = len(buffer)
-    for plen in range(min_pattern_len, min(max_pattern_len + 1, buf_len // min_repeats + 1)):
-        tail_needed = plen * min_repeats
-        if tail_needed > buf_len:
-            continue
-        tail = buffer[-tail_needed:]
-        pattern = tail[:plen]
-        if pattern * min_repeats == tail:
-            return True
-    return False
+
+def _truncate_at_repetition(text: str, min_pattern_len: int = 10, max_pattern_len: int = 80) -> str:
+    """Find where text starts looping and truncate, keeping first 2 occurrences of the repeated pattern."""
+    buf_len = len(text)
+    for plen in range(min_pattern_len, min(max_pattern_len + 1, buf_len // 3 + 1)):
+        # Scan from the end backwards to find where repetition starts
+        for start in range(buf_len - plen * 3, -1, -plen):
+            if start < 0:
+                break
+            candidate = text[start : start + plen]
+            # Count consecutive repeats from this position
+            count = 0
+            pos = start
+            while pos + plen <= buf_len and text[pos : pos + plen] == candidate:
+                count += 1
+                pos += plen
+            if count >= 3:
+                # Found repetition: keep up to 2 occurrences
+                cut_at = start + plen * 2
+                return text[:cut_at]
+    # No repetition found, return as-is
+    return text
 
 
 def _stream_with_loop_detection(
@@ -181,18 +182,19 @@ def _stream_with_loop_detection(
     expected_output_len: int,
     verbose: bool = False,
 ) -> str:
-    """Stream SSE response, detecting infinite loops and runaway output."""
+    """Stream SSE response. On runaway, truncate and return partial result."""
     r = requests.post(
         endpoint, json=payload,
         timeout=(10, timeout_s),
         stream=True,
     )
     r.raise_for_status()
+    r.encoding = "utf-8"
 
     collected: List[str] = []
-    buffer = ""
-    total_len = 0
-    last_check_len = 0
+    total_content_len = 0
+    had_output = False
+    runaway = False
 
     try:
         for raw_line in r.iter_lines(decode_unicode=True):
@@ -207,42 +209,56 @@ def _stream_with_loop_detection(
             except json.JSONDecodeError:
                 continue
 
-            delta = ""
             try:
-                delta = chunk["choices"][0]["delta"].get("content", "")
+                delta_obj = chunk["choices"][0]["delta"]
             except (KeyError, IndexError, TypeError):
                 continue
 
-            if not delta:
-                continue
+            # Process thinking/reasoning tokens
+            thinking = ""
+            for key in ("reasoning_content", "reasoning"):
+                t = delta_obj.get(key, "")
+                if t:
+                    thinking += t
+            if thinking:
+                had_output = True
+                if verbose:
+                    sys.stdout.write(thinking)
+                    sys.stdout.flush()
 
-            if verbose:
-                sys.stderr.write(delta)
-                sys.stderr.flush()
+            # Process content tokens
+            delta = delta_obj.get("content", "")
+            if delta:
+                had_output = True
+                if verbose:
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+                collected.append(delta)
+                total_content_len += len(delta)
 
-            collected.append(delta)
-            total_len += len(delta)
-            buffer = (buffer + delta)[-500:]
-
-            # Check every ~200 chars
-            if total_len - last_check_len >= 200:
-                last_check_len = total_len
-
-                if _detect_repetition(buffer):
-                    raise LoopDetectedError(
-                        f"Repeating pattern detected after {total_len} chars"
-                    )
-
-                if expected_output_len > 0 and total_len > expected_output_len * 3:
-                    raise LoopDetectedError(
-                        f"Runaway output: {total_len} chars (expected ~{expected_output_len})"
-                    )
+            # Runaway: stop collecting, close connection
+            if expected_output_len > 0 and total_content_len > expected_output_len * 3:
+                runaway = True
+                break
     finally:
-        if verbose and collected:
-            sys.stderr.write("\n")
+        if verbose and had_output:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         r.close()
 
-    return "".join(collected)
+    raw_output = "".join(collected)
+    if runaway:
+        sys.stderr.write(
+            f"[RUNAWAY] Content output {total_content_len} chars exceeded 3x expected "
+            f"(~{expected_output_len}). Truncating at repetition...\n"
+        )
+        cleaned = _truncate_at_repetition(raw_output)
+        sys.stderr.write(
+            f"[RUNAWAY] Kept {len(cleaned)}/{len(raw_output)} chars after cleanup.\n"
+        )
+        return cleaned
+
+    return raw_output
 
 
 def post_messages(
@@ -253,11 +269,15 @@ def post_messages(
     stream: bool = False,
     expected_output_len: int = 0,
     verbose: bool = False,
+    override_params: Optional[Dict[str, Any]] = None,
 ) -> str:
     global _streaming_available
     payload: Dict[str, Any] = {"messages": messages}
     if extra_payload:
         payload.update(extra_payload)
+    payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if override_params:
+        payload.update(override_params)
 
     if verbose:
         msg_lens = ", ".join(f"{m['role']}:{len(m['content'])}ch" for m in messages)
@@ -277,8 +297,6 @@ def post_messages(
                 sys.stderr.write("[WARN] Streaming not supported by backend, falling back.\n")
             else:
                 raise
-        except LoopDetectedError:
-            raise
 
     # Non-streaming path
     r = requests.post(endpoint, json=payload, timeout=timeout_s)
@@ -344,12 +362,14 @@ def translate_lines_via_backend(
     retry_sleep_s: float,
     use_stream: bool = True,
     verbose: bool = False,
+    chunk_size: int = 10,
 ) -> List[str]:
-    """Translate all lines in a single request using numbered I/O with streaming."""
+    """Translate lines in small chunks (chunk_size each) to avoid model loops."""
     if not lines:
         return []
 
-    def _call_backend(messages: List[Dict[str, str]], hint_len: int = 0) -> str:
+    def _call_backend(messages: List[Dict[str, str]], hint_len: int = 0,
+                      override_params: Optional[Dict[str, Any]] = None) -> str:
         last_err: Optional[Exception] = None
         for attempt in range(1, retry + 2):
             if verbose:
@@ -363,14 +383,8 @@ def translate_lines_via_backend(
                     stream=use_stream,
                     expected_output_len=hint_len,
                     verbose=verbose,
+                    override_params=override_params,
                 )
-            except LoopDetectedError as e:
-                last_err = e
-                sys.stderr.write(
-                    f"[LOOP] Attempt {attempt}/{retry + 1}: {e}. Retrying...\n"
-                )
-                if attempt <= retry:
-                    time.sleep(retry_sleep_s)
             except Exception as e:
                 last_err = e
                 sys.stderr.write(
@@ -380,68 +394,81 @@ def translate_lines_via_backend(
                     time.sleep(retry_sleep_s)
         raise RuntimeError(f"Backend failed after {retry + 1} attempts: {last_err}")
 
-    sys.stderr.write(f"[INFO] Translating {len(lines)} lines in one request...\n")
+    # Pass 1: direct literal translation only. No reasoning about context.
+    # The user_prefix already specifies the language pair.
+    pass1_prompt = (
+        "You are a literal subtitle translator.\n"
+        "\n"
+        "RULES:\n"
+        "- Translate each line INDEPENDENTLY. Do NOT reason about context between lines.\n"
+        "- Do NOT think about what makes sense in the story. Do NOT infer meaning.\n"
+        "- Just convert the words directly. Be fast and mechanical.\n"
+        "- If a word looks strange or meaningless, translate it literally and wrap the "
+        "ENTIRE line with ?? markers. Example: `[5] ??他说了奇怪的话??`\n"
+        "- Output format: `[N] translated_text` for every input line, in order.\n"
+        "- No commentary, no explanations, no merging lines."
+    )
+    # Append glossary from system_prompt if present
+    if "---" in system_prompt:
+        glossary_part = system_prompt.split("---", 1)[1]
+        pass1_prompt += "\n\n---" + glossary_part
 
-    if verbose:
-        sys.stderr.write(f"  [DETAIL] System prompt length: {len(system_prompt)} chars\n")
-        preview = lines[:3]
-        sys.stderr.write(f"  [DETAIL] First lines: {preview}\n")
-
-    numbered_input = format_numbered_input(lines, start_index=1)
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prefix + numbered_input},
-    ]
-
-    out_text = _call_backend(messages, hint_len=len(numbered_input))
-    translations, missing = parse_numbered_output(out_text, len(lines), start_index=1)
-
-    if not missing:
-        sys.stderr.write(f"[OK] All {len(lines)} lines translated.\n")
-        return [t or "" for t in translations]
-
-    # Repair missing lines (up to 3 rounds)
-    max_repair_rounds = 3
-    for round_num in range(1, max_repair_rounds + 1):
-        sys.stderr.write(
-            f"[REPAIR] Round {round_num}: {len(missing)}/{len(lines)} lines missing. "
-            f"Sending repair request...\n"
-        )
-        repair_lines = [f"[{i}] {lines[i - 1]}" for i in missing]
-        repair_input = "\n".join(repair_lines)
-        repair_messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "The following lines were missing from your previous output. "
-                    "Translate ONLY these lines, keeping the [N] format:\n"
-                    + repair_input
-                ),
-            },
+    def _translate_chunk(chunk: List[str], start_idx: int, chunk_label: str) -> List[str]:
+        """Translate a single chunk with numbered I/O, retry on missing lines."""
+        numbered = format_numbered_input(chunk, start_index=start_idx)
+        msgs = [
+            {"role": "system", "content": pass1_prompt},
+            {"role": "user", "content": user_prefix + numbered},
         ]
 
-        try:
-            repair_text = _call_backend(repair_messages, hint_len=len(repair_input))
-            for m in _NUMBERED_LINE_RE.finditer(repair_text):
-                num = int(m.group(1))
-                if 1 <= num <= len(lines) and translations[num - 1] is None:
-                    translations[num - 1] = m.group(2)
-        except Exception as e:
-            sys.stderr.write(f"[WARN] Repair round {round_num} failed: {e}\n")
+        out_text = _call_backend(msgs, hint_len=len(numbered),
+                                 override_params=None)
+        translations, missing = parse_numbered_output(out_text, len(chunk), start_index=start_idx)
 
-        missing = [i for i in range(1, len(lines) + 1) if translations[i - 1] is None]
-        if not missing:
-            sys.stderr.write(f"[OK] All {len(lines)} lines translated after {round_num} repair round(s).\n")
-            break
+        # One repair attempt for missing lines
+        if missing and len(missing) < len(chunk):
+            sys.stderr.write(
+                f"[REPAIR] {chunk_label}: {len(missing)} missing lines. Repairing...\n"
+            )
+            repair_lines = [f"[{i}] {chunk[i - start_idx]}" for i in missing]
+            repair_msgs = [
+                {"role": "system", "content": pass1_prompt},
+                {
+                    "role": "user",
+                    "content": "Translate ONLY these lines, keeping the [N] format:\n"
+                    + "\n".join(repair_lines),
+                },
+            ]
+            try:
+                repair_text = _call_backend(repair_msgs, hint_len=len("\n".join(repair_lines)),
+                                                                              override_params=None)
+                for m in _NUMBERED_LINE_RE.finditer(repair_text):
+                    num = int(m.group(1))
+                    idx = num - start_idx
+                    if 0 <= idx < len(chunk) and translations[idx] is None:
+                        translations[idx] = m.group(2)
+            except Exception as e:
+                sys.stderr.write(f"[WARN] {chunk_label} repair failed: {e}\n")
 
-    if missing:
-        sys.stderr.write(
-            f"[WARN] {len(missing)} lines still missing after {max_repair_rounds} repair rounds: "
-            f"{missing[:20]}{'...' if len(missing) > 20 else ''}. Using empty strings.\n"
-        )
+        return [t if t is not None else "" for t in translations]
 
-    return [t if t is not None else "" for t in translations]
+    # === Pass 1: Chunked translation ===
+    num_chunks = (len(lines) + chunk_size - 1) // chunk_size
+    sys.stderr.write(f"[INFO] Translating {len(lines)} lines in {num_chunks} chunks of {chunk_size}...\n")
+
+    if verbose:
+        sys.stderr.write(f"  [DETAIL] System prompt: {len(system_prompt)} chars\n")
+
+    translated: List[str] = []
+    for ci in range(0, len(lines), chunk_size):
+        chunk = lines[ci : ci + chunk_size]
+        chunk_num = ci // chunk_size + 1
+        sys.stderr.write(f"[CHUNK {chunk_num}/{num_chunks}] Lines {ci + 1}-{ci + len(chunk)}\n")
+        result = _translate_chunk(chunk, start_idx=ci + 1, chunk_label=f"chunk_{chunk_num}")
+        translated.extend(result)
+
+    sys.stderr.write(f"[OK] All {len(lines)} lines translated.\n")
+    return translated
 
 
 def build_line_mapping(blocks: List[SrtBlock]) -> Tuple[List[str], List[Tuple[int, int]]]:
@@ -535,7 +562,7 @@ def group_files_by_series(
             messages=messages,
             timeout_s=min(timeout_s, 60),
             extra_payload=extra_payload,
-            stream=False,
+            stream=verbose,
             verbose=verbose,
         )
         if verbose:
@@ -631,7 +658,7 @@ def extract_glossary(
             messages=messages,
             timeout_s=min(timeout_s, 60),
             extra_payload=extra_payload,
-            stream=False,
+            stream=verbose,
             verbose=verbose,
         )
         # Basic validation: should have at least one → symbol
@@ -772,6 +799,18 @@ def main() -> int:
         help="Extra JSON fields for POST body (e.g. '{\"model\":\"local\",\"temperature\":0}')",
     )
     ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=10,
+        help="Lines per translation chunk in pass 1 (default: 10). Smaller = more stable, larger = faster.",
+    )
+    ap.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.3,
+        help="Repetition penalty for pass 1 to prevent model loops (default: 1.3). Set 1.0 to disable.",
+    )
+    ap.add_argument(
         "--no-group",
         action="store_true",
         default=False,
@@ -811,6 +850,12 @@ def main() -> int:
         except Exception as e:
             print(f"ERROR: --extra-payload is not valid JSON object: {e}", file=sys.stderr)
             return 2
+
+    # Inject repetition_penalty into extra_payload for all LLM calls
+    if args.repetition_penalty != 1.0:
+        if extra_payload is None:
+            extra_payload = {}
+        extra_payload.setdefault("repetition_penalty", args.repetition_penalty)
 
     use_stream = not args.no_stream
     verbose = args.verbose
@@ -873,6 +918,7 @@ def main() -> int:
                 retry_sleep_s=args.retry_sleep,
                 use_stream=use_stream,
                 verbose=verbose,
+                chunk_size=args.chunk_size,
             )
 
             apply_translations(blocks, refs, translated_lines)

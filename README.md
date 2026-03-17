@@ -59,18 +59,18 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 | `--system-prompt` | (built-in) | System prompt (`{source_lang}` / `{target_lang}` placeholders) |
 | `--user-prefix` | (built-in) | User message prefix (supports placeholders) |
 | `--extra-payload` | "" | Extra JSON fields for API body |
+| `--chunk-size` | 10 | Lines per chunk in pass 1 (smaller = more stable) |
 | `--no-group` | false | Disable series grouping |
 | `--no-stream` | false | Disable streaming (no loop detection) |
 | `--verbose` / `-v` | false | Show detailed progress and stream LLM responses to stderr |
 
 ## How It Works
 
-### Translation
-1. **Number lines**: Formats all subtitle text as `[1] text`, `[2] text`, ...
-2. **Translate in one shot**: Sends the entire file to the backend in a single request
-3. **Fix ASR errors**: Model corrects Whisper transcription errors using full context
-4. **Parse numbered output**: Extracts translations by `[N] translated_text` pattern
-5. **Auto-repair gaps**: Sends targeted repair requests for missing lines (up to 3 rounds)
+### Two-Pass Translation
+1. **Pass 1 — Chunked translation**: Splits lines into small chunks (`--chunk-size`, default 10) and translates each independently. Small chunks avoid model loops.
+2. **Pass 2 — Context refinement**: Sends ALL source lines + draft translations to the model for a full-context review pass, fixing inconsistent names, broken continuity, and mistranslations.
+3. **ASR error correction**: Both passes instruct the model to fix Whisper transcription errors.
+4. **Numbered I/O**: Uses `[N] text` format for precise line tracking in both passes.
 
 ### Series Grouping
 When given multiple files, the tool asks the LLM to group them by series (based on filenames). Files in the same series are translated in episode order with a shared **glossary** of character names and key terms, ensuring consistent naming across episodes. The glossary resets between different series. Use `--no-group` to disable.
