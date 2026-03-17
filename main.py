@@ -181,6 +181,7 @@ def _stream_with_loop_detection(
     timeout_s: int,
     expected_output_len: int,
     verbose: bool = False,
+    max_thinking_len: int = 0,
 ) -> str:
     """Stream SSE response. On runaway, truncate and return partial result."""
     r = requests.post(
@@ -193,6 +194,7 @@ def _stream_with_loop_detection(
 
     collected: List[str] = []
     total_content_len = 0
+    total_thinking_len = 0
     had_output = False
     runaway = False
 
@@ -222,9 +224,18 @@ def _stream_with_loop_detection(
                     thinking += t
             if thinking:
                 had_output = True
+                total_thinking_len += len(thinking)
                 if verbose:
                     sys.stdout.write(thinking)
                     sys.stdout.flush()
+
+            # Thinking runaway: abort so caller can retry
+            if max_thinking_len > 0 and total_thinking_len > max_thinking_len:
+                r.close()
+                raise RuntimeError(
+                    f"Thinking output ({total_thinking_len} chars) exceeded limit "
+                    f"({max_thinking_len}). Model may be producing garbage."
+                )
 
             # Process content tokens
             delta = delta_obj.get("content", "")
@@ -271,6 +282,7 @@ def post_messages(
     verbose: bool = False,
     override_params: Optional[Dict[str, Any]] = None,
     enable_thinking: bool = False,
+    max_thinking_len: int = 0,
 ) -> str:
     global _streaming_available
     payload: Dict[str, Any] = {"messages": messages}
@@ -291,6 +303,7 @@ def post_messages(
             return _stream_with_loop_detection(
                 endpoint, stream_payload, timeout_s, expected_output_len,
                 verbose=verbose,
+                max_thinking_len=max_thinking_len,
             )
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code < 500:
@@ -795,6 +808,7 @@ def proofread_file(
                 expected_output_len=len(pairs_text),
                 verbose=verbose,
                 enable_thinking=True,
+                max_thinking_len=32768,
             )
             results, missing = parse_numbered_output(raw, len(source_lines))
 
