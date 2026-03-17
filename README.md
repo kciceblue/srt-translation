@@ -59,38 +59,36 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 | `--system-prompt` | (built-in) | System prompt (`{source_lang}` / `{target_lang}` placeholders) |
 | `--user-prefix` | (built-in) | User message prefix (supports placeholders) |
 | `--extra-payload` | "" | Extra JSON fields for API body |
-| `--chunk-size` | 10 | Lines per chunk in pass 1 (smaller = more stable) |
+| `--chunk-size` | 10 | Lines per translation chunk (smaller = more stable) |
+| `--repetition-penalty` | 1.3 | Repetition penalty for all LLM calls (1.0 to disable) |
 | `--no-group` | false | Disable series grouping |
-| `--no-stream` | false | Disable streaming (no loop detection) |
-| `--verbose` / `-v` | false | Show detailed progress and stream LLM responses to stderr |
+| `--no-stream` | false | Disable streaming |
+| `--verbose` / `-v` | false | Show detailed progress and stream LLM responses to stdout |
 
 ## How It Works
 
-### Two-Pass Translation
-1. **Pass 1 — Chunked translation**: Splits lines into small chunks (`--chunk-size`, default 10) and translates each independently. Small chunks avoid model loops.
-2. **Pass 2 — Context refinement**: Sends ALL source lines + draft translations to the model for a full-context review pass, fixing inconsistent names, broken continuity, and mistranslations.
-3. **ASR error correction**: Both passes instruct the model to fix Whisper transcription errors.
-4. **Numbered I/O**: Uses `[N] text` format for precise line tracking in both passes.
+### Chunked Translation
+1. **Split into chunks**: Divides subtitle lines into small chunks (`--chunk-size`, default 10). Small chunks prevent the model from looping.
+2. **Literal translation**: Each chunk is translated independently with thinking disabled. Uncertain words are flagged with `??` markers.
+3. **Numbered I/O**: Uses `[N] text` format for precise line tracking. Missing lines get one repair attempt per chunk.
 
 ### Series Grouping
 When given multiple files, the tool asks the LLM to group them by series (based on filenames). Files in the same series are translated in episode order with a shared **glossary** of character names and key terms, ensuring consistent naming across episodes. The glossary resets between different series. Use `--no-group` to disable.
 
-### Loop Detection
-Uses SSE streaming to detect when the model gets stuck in an infinite loop (repeating the same pattern). On detection, the connection is closed immediately and the request is retried. Use `--no-stream` to disable.
+### Runaway Detection
+Uses SSE streaming to monitor output length. If content output exceeds 3x the expected length, the stream is closed and the collected output is truncated at the first repeating pattern (keeping 2 occurrences). The partial result is used and translation continues to the next chunk. Use `--no-stream` to disable streaming.
 
-## Recommended Temperature
+## Recommended Settings
 
-Use **temperature 0.3** via `--extra-payload '{"temperature":0.3}'`.
-
-- **Not 0**: The model needs some flexibility to infer and correct Whisper transcription errors from context. Strictly deterministic output tends to translate garbled words literally.
-- **Not 0.6+**: Higher temperature increases hallucination risk, inconsistent character names, format deviations (triggering more repair rounds), and is more likely to trigger infinite loops.
-- **0.2** if the model still loops occasionally; **0.4** if ASR corrections feel too conservative.
+- **Temperature 0.2–0.3**: Low enough to stay stable, high enough to not translate garbled words literally. Set via `--extra-payload '{"temperature":0.3}'`.
+- **Repetition penalty 1.3+**: Prevents the model from looping. Increase if loops persist. Set via `--repetition-penalty`.
+- **Chunk size 10**: Default. Reduce to 5 if the model still loops on complex content.
 
 ## Troubleshooting
 
-**Missing lines in output**: Auto-repaired in up to 3 rounds
+**Missing lines in output**: Each chunk gets one auto-repair attempt
 
-**Model loops / hangs**: Detected automatically via streaming. If `--no-stream`, increase `--retry`
+**Model loops / hangs**: Increase `--repetition-penalty`, decrease `--chunk-size`, or lower temperature
 
 **Backend errors**: Ensure endpoint URL is correct and backend is running
 
