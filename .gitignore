@@ -15,6 +15,9 @@ out/
 translated_out/
 *.srt
 
+# Vocabulary (user-specific, auto-updated by the tool)
+vocab.txt
+
 # OS
 .DS_Store
 Thumbs.db

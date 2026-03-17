@@ -64,6 +64,8 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 | `--no-group` | false | Disable series grouping |
 | `--no-stream` | false | Disable streaming |
 | `--verbose` / `-v` | false | Show detailed progress and stream LLM responses to stdout |
+| `--proofread` | false | Enable proofread pass after translation |
+| `--vocab` | vocab.txt | Vocabulary file — loaded at startup, updated with learnt terms after each run. Set to `''` to disable. |
 
 ## How It Works
 
@@ -74,6 +76,12 @@ python main.py subs/ --endpoint http://... --source-lang Korean --target-lang En
 
 ### Series Grouping
 When given multiple files, the tool asks the LLM to group them by series (based on filenames). Files in the same series are translated in episode order with a shared **glossary** of character names and key terms, ensuring consistent naming across episodes. The glossary resets between different series. Use `--no-group` to disable.
+
+### Persistent Vocabulary
+A vocabulary file (`vocab.txt` by default) is loaded at startup and updated with learnt terms after each translation run. The file uses a simple `SourceTerm → TranslatedTerm` format and can be edited freely between runs. Change the path with `--vocab`, or set `--vocab ''` to disable. Vocabulary is also fed into the translation glossary and proofread prompt for consistent naming.
+
+### Proofread Pass
+When `--proofread` is enabled, after all files in a series are translated, a second pass reviews each file's source+translation pairs with the full vocabulary context (`--vocab` file + LLM-learnt glossary from the series). The proofreader fixes `??`-flagged lines, inconsistent names, and mistranslations. If proofread fails for a file, the original translation is kept.
 
 ### Runaway Detection
 Uses SSE streaming to monitor output length. If content output exceeds 3x the expected length, the stream is closed and the collected output is truncated at the first repeating pattern (keeping 2 occurrences). The partial result is used and translation continues to the next chunk. Use `--no-stream` to disable streaming.

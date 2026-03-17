@@ -17,4 +17,5 @@ python3 main.py "$INPUT" \
   --target-lang "$TARGET_LANG" \
   --extra-payload "$EXTRA" \
   --repetition-penalty 0 \
-  --verbose
+  --verbose \
+  --proofread

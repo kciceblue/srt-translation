@@ -673,6 +673,150 @@ def extract_glossary(
 
 
 # ---------------------------
+# Persistent vocabulary
+# ---------------------------
+
+_VOCAB_HEADER = (
+    "# Vocabulary file for SRT subtitle translator\n"
+    "# Format: SourceTerm → TranslatedTerm  (one per line)\n"
+    "# Lines starting with # are comments and are ignored\n"
+    "#\n"
+    "# This file is loaded automatically at startup.\n"
+    "# Learnt terms from each translation run are merged back here.\n"
+    "# Feel free to edit, add, or remove entries between runs.\n"
+    "#\n"
+)
+
+
+def _parse_vocab(text: str) -> Dict[str, str]:
+    """Parse vocab text into {source_term: translated_term} dict."""
+    entries: Dict[str, str] = {}
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for sep in ("→", "->"):
+            if sep in line:
+                parts = line.split(sep, 1)
+                src = parts[0].strip()
+                tgt = parts[1].strip()
+                if src and tgt:
+                    entries[src] = tgt
+                break
+    return entries
+
+
+def _format_vocab(entries: Dict[str, str]) -> str:
+    """Format vocab entries as SourceTerm → TranslatedTerm lines."""
+    return "\n".join(f"{src} → {tgt}" for src, tgt in sorted(entries.items()))
+
+
+def _save_vocab(path: str, entries: Dict[str, str]) -> None:
+    """Save vocab entries to file with header."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_VOCAB_HEADER)
+        f.write(_format_vocab(entries))
+        f.write("\n")
+
+
+# ---------------------------
+# Proofread pass
+# ---------------------------
+
+
+def proofread_file(
+    source_lines: List[str],
+    translated_lines: List[str],
+    endpoint: str,
+    timeout_s: int,
+    extra_payload: Optional[Dict[str, Any]],
+    vocab_table: str,
+    use_stream: bool,
+    verbose: bool,
+    retry: int,
+    retry_sleep_s: float,
+    source_lang: str,
+    target_lang: str,
+) -> List[str]:
+    """Proofread translated lines using source+translation pairs and vocabulary context."""
+    if not source_lines or not translated_lines:
+        return translated_lines
+
+    # Build side-by-side numbered pairs
+    pairs = []
+    for i, (src, tgt) in enumerate(zip(source_lines, translated_lines), start=1):
+        pairs.append(f"[{i}] {src} → {tgt}")
+    pairs_text = "\n".join(pairs)
+
+    system_content = (
+        f"You are a subtitle proofreader reviewing {source_lang} to {target_lang} translations.\n"
+        "\n"
+        "RULES:\n"
+        "- Review each line's translation for accuracy and naturalness.\n"
+        "- Fix lines flagged with ?? markers using surrounding context.\n"
+        "- Fix inconsistent character names, mistranslations, and broken continuity.\n"
+        "- Use the provided vocabulary table for correct term translations.\n"
+        "- Output ALL lines as `[N] corrected_text` (the corrected translation only, not the source).\n"
+        "- If a line's translation is correct, output it unchanged (but remove any ?? markers).\n"
+        "- No commentary, no explanations, no merging lines."
+    )
+
+    if vocab_table:
+        system_content += f"\n\nVocabulary reference:\n{vocab_table}"
+
+    user_content = f"Review and correct these translations:\n{pairs_text}"
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retry + 2):
+        if verbose:
+            sys.stderr.write(f"  [PROOFREAD] Attempt {attempt}/{retry + 1}\n")
+        try:
+            raw = post_messages(
+                endpoint=endpoint,
+                messages=messages,
+                timeout_s=timeout_s,
+                extra_payload=extra_payload,
+                stream=use_stream,
+                expected_output_len=len(pairs_text),
+                verbose=verbose,
+            )
+            results, missing = parse_numbered_output(raw, len(source_lines))
+
+            # Merge: use proofread result where available, keep original for missing
+            final = []
+            for proofread, original in zip(results, translated_lines):
+                if proofread is not None:
+                    final.append(proofread)
+                else:
+                    final.append(original)
+
+            if missing:
+                sys.stderr.write(
+                    f"[WARN] Proofread missed {len(missing)} lines, kept original translations.\n"
+                )
+
+            return final
+        except Exception as e:
+            last_err = e
+            sys.stderr.write(
+                f"[RETRY] Proofread failed (attempt {attempt}/{retry + 1}): {e}\n"
+            )
+            if attempt <= retry:
+                time.sleep(retry_sleep_s)
+
+    sys.stderr.write(
+        f"[WARN] Proofread failed after {retry + 1} attempts: {last_err}. "
+        "Keeping original translation.\n"
+    )
+    return translated_lines
+
+
+# ---------------------------
 # CLI
 # ---------------------------
 
@@ -828,6 +972,17 @@ def main() -> int:
         default=False,
         help="Show detailed progress and stream LLM responses to stderr",
     )
+    ap.add_argument(
+        "--proofread",
+        action="store_true",
+        default=False,
+        help="Enable proofread pass after translation to fix ?? markers, inconsistencies, and errors",
+    )
+    ap.add_argument(
+        "--vocab",
+        default="vocab.txt",
+        help="Path to vocabulary file (default: vocab.txt). Loaded at startup, updated with learnt terms after each run. Set to '' to disable.",
+    )
 
     args = ap.parse_args()
 
@@ -860,6 +1015,21 @@ def main() -> int:
     use_stream = not args.no_stream
     verbose = args.verbose
 
+    # Load user vocabulary file
+    user_vocab = ""
+    vocab_entries: Dict[str, str] = {}
+    if args.vocab:
+        vocab_path = args.vocab
+        if os.path.isfile(vocab_path):
+            raw = _read_text_file(vocab_path).strip()
+            if raw:
+                vocab_entries = _parse_vocab(raw)
+                user_vocab = _format_vocab(vocab_entries)
+                sys.stderr.write(f"[INFO] Loaded vocabulary: {len(vocab_entries)} entries from {vocab_path}\n")
+        elif vocab_path != "vocab.txt":
+            # Only warn for non-default paths; default will be created after first run
+            print(f"[WARN] Vocabulary file not found: {vocab_path}", file=sys.stderr)
+
     # Group files by series
     if args.no_group:
         groups: List[Tuple[str, List[str]]] = [("All", input_paths)]
@@ -874,6 +1044,7 @@ def main() -> int:
             print(f"\n[SERIES {group_idx}/{len(groups)}] \"{series_name}\" ({len(group_paths)} files)")
 
         glossary = ""  # Reset per series
+        series_results = []  # Accumulate for proofread pass
 
         for file_idx, path in enumerate(group_paths):
             base = os.path.basename(path)
@@ -929,15 +1100,61 @@ def main() -> int:
 
             print(f"[INFO] Wrote: {out_path}")
 
-            # Extract glossary for next episode in this series
-            if len(group_paths) > 1 and file_idx < len(group_paths) - 1:
-                sys.stderr.write("[INFO] Extracting glossary for next episode...\n")
+            if args.proofread:
+                series_results.append((out_path, flat_lines, translated_lines, blocks, refs))
+
+            # Extract glossary: for next episode, or on last file for vocab persistence / proofread
+            is_last = file_idx == len(group_paths) - 1
+            need_glossary_for_next = not is_last and len(group_paths) > 1
+            need_glossary_for_save = is_last and (args.vocab or args.proofread)
+            if need_glossary_for_next or need_glossary_for_save:
+                sys.stderr.write("[INFO] Extracting glossary...\n")
                 glossary = extract_glossary(
                     flat_lines, translated_lines,
                     args.endpoint, args.timeout,
                     extra_payload, glossary,
                     verbose=verbose,
                 )
+
+        # Proofread pass: review each file with full vocabulary context
+        if args.proofread and series_results:
+            vocab_parts = []
+            if user_vocab:
+                vocab_parts.append(user_vocab)
+            if glossary:
+                vocab_parts.append(glossary)
+            vocab_table = "\n".join(vocab_parts)
+
+            print(f"\n[PROOFREAD] Reviewing {len(series_results)} file(s) in \"{series_name}\"...")
+            for out_path, flat_lines, translated_lines, blocks, refs in series_results:
+                sys.stderr.write(f"[PROOFREAD] {os.path.basename(out_path)}\n")
+                proofread_result = proofread_file(
+                    source_lines=flat_lines,
+                    translated_lines=translated_lines,
+                    endpoint=args.endpoint,
+                    timeout_s=args.timeout,
+                    extra_payload=extra_payload,
+                    vocab_table=vocab_table,
+                    use_stream=use_stream,
+                    verbose=verbose,
+                    retry=args.retry,
+                    retry_sleep_s=args.retry_sleep,
+                    source_lang=args.source_lang,
+                    target_lang=args.target_lang,
+                )
+                apply_translations(blocks, refs, proofread_result)
+                out_srt = write_srt(blocks)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(out_srt)
+                print(f"[PROOFREAD] Updated: {out_path}")
+
+        # Save learnt glossary to vocab file
+        if args.vocab and glossary:
+            new_entries = _parse_vocab(glossary)
+            vocab_entries.update(new_entries)
+            user_vocab = _format_vocab(vocab_entries)
+            _save_vocab(args.vocab, vocab_entries)
+            sys.stderr.write(f"[INFO] Saved {len(vocab_entries)} vocab entries to {args.vocab}\n")
 
     return 0
 
