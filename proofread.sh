@@ -10,12 +10,10 @@ TARGET_LANG="Simplified Chinese"
 EXTRA='{"model":"local/qwen3.5","temperature":0.2}'
 # ─────────────────────────────────────────────────────────────────────
 
-python3 main.py "$INPUT" \
-  --proofread \
+python3 proofread.py "$INPUT" \
   --endpoint "$ENDPOINT" \
   --out-dir "$OUT_DIR" \
   --source-lang "$SOURCE_LANG" \
   --target-lang "$TARGET_LANG" \
   --extra-payload "$EXTRA" \
-  --repetition-penalty 0 \
   --verbose
