@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Configuration (edit these) ───────────────────────────────────────
+ENDPOINT="http://127.0.0.1:5000/v1/chat/completions"
+INPUT="subs/*.srt"
+OUT_DIR="out"
+SOURCE_LANG="Japanese"
+TARGET_LANG="Simplified Chinese"
+EXTRA='{"model":"qwen3.5-35b","temperature":0}'
+# ─────────────────────────────────────────────────────────────────────
+
+python3 main.py "$INPUT" \
+  --endpoint "$ENDPOINT" \
+  --out-dir "$OUT_DIR" \
+  --source-lang "$SOURCE_LANG" \
+  --target-lang "$TARGET_LANG" \
+  --extra-payload "$EXTRA"
