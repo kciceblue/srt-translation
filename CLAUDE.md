@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SRT subtitle translator — two Python CLI tools that translate and proofread `.srt` subtitle files via an OpenAI-compatible backend API. `main.py` handles translation (chunked, with series grouping and runaway detection). `proofread.py` is a standalone 2-pass proofreader that reviews translations without thinking mode.
+SRT subtitle translator — a 5-step pipeline that translates `.srt` subtitle files via an OpenAI-compatible backend API. Single CLI entry point (`cli.py`) with subcommands for each step, plus a `run` subcommand for the full pipeline. Per-series tmp folder state tracks progress across steps.
 
 Default configuration translates Japanese to Simplified Chinese. Language pair configurable via `--source-lang` / `--target-lang`.
 
@@ -16,12 +16,15 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Translate (files, directories, or globs)
-python main.py subs/ --endpoint http://127.0.0.1:5000/v1/chat/completions --out-dir out
-python main.py movie.srt subs/ --endpoint http://... --out-dir out
+# Full pipeline (input → preprocess → translate → postprocess → proofread)
+python cli.py run subs/ --endpoint http://127.0.0.1:5000/v1/chat/completions --out-dir out
 
-# Proofread (separate step, after translation)
-python proofread.py subs/ --endpoint http://127.0.0.1:5000/v1/chat/completions --out-dir out
+# Individual steps (each reads/writes tmp/ state)
+python cli.py input subs/ --endpoint http://... --debug
+python cli.py preprocess --endpoint http://... --debug
+python cli.py translate --endpoint http://... --debug
+python cli.py postprocess --endpoint http://... --debug
+python cli.py proofread --endpoint http://... --out-dir out --debug
 
 # Quick run with local config
 ./run.sh
@@ -31,49 +34,83 @@ There are no tests or linting configured.
 
 ## Architecture
 
-### main.py — Translation
+### File Structure
 
-Shared infrastructure and translation logic:
+```
+cli.py          # Entry point with argparse subcommands
+core.py         # Shared: SRT parsing, backend/runaway, numbered I/O, vocab, utils
+input_step.py   # Step 1: Expand inputs, warn non-SRT, series grouping, tmp setup
+preprocess.py   # Step 2: ASR flag/fix, context.md, vocab.md
+translate.py    # Step 3: Chunked translation with vocab+context
+postprocess.py  # Step 4: Flag unfit translations → flags.json
+proofread.py    # Step 5: Fix flagged lines, final review, confused.md
+```
 
-1. **SRT parsing/writing** — `parse_srt()` / `write_srt()` / `SrtBlock` dataclass. Handles encoding detection (UTF-8 BOM, UTF-16, CP1252 fallback) and tolerant parsing of malformed SRT files.
+### core.py — Shared Infrastructure
 
-2. **Backend interaction** — `post_messages()` with dual-mode: non-streaming (blocking) and SSE streaming. `_stream_with_loop_detection()` monitors content length and truncates at repetition on runaway (`runaway_multiplier` param, default 3x). `raise_on_runaway=True` makes it raise instead of returning truncated output (used by proofread steps with retry logic). Auto-falls back to non-streaming if backend doesn't support it.
+1. **SRT parsing/writing** — `SrtBlock`, `parse_srt()`, `write_srt()`, `read_text_file()`. Handles encoding detection (UTF-8 BOM, UTF-16, CP1252 fallback) and tolerant parsing of malformed SRT files.
 
-3. **Numbered I/O helpers** — `format_numbered_input()` / `parse_numbered_output()`. Explicit `[N] text` anchors for robust line mapping.
+2. **Backend interaction** — `post_messages()` with dual-mode: non-streaming and SSE streaming. `_stream_with_loop_detection()` has three layers of protection: (a) exact repetition detection (pattern ≥10x → keep 1 occurrence), (b) reasoning babble detection (hedge words like "Wait,", "Actually," ≥6 in 600 chars → strip babble), (c) multiplier-based runaway (output > N× expected → truncate). Auto-falls back to non-streaming if backend doesn't support it.
 
-4. **Translation workflow** — `translate_lines_via_backend()` translates in small chunks (`--chunk-size`, default 10). Each chunk is translated independently with a literal translation prompt (no context reasoning). Uncertain words flagged with `??` markers. One repair attempt per chunk for missing lines. Repetition penalty applied globally.
+3. **LLM wrappers** — `call_llm()` (thin wrapper, builds messages list, thinking always disabled) and `call_llm_with_retry()` (adds retry logic with sleep).
 
-5. **Series grouping** — `group_files_by_series()` sends filenames to the LLM to group by series and sort by episode order. `extract_glossary()` builds a rolling glossary of character names/terms from each translated episode. Glossary resets between series.
+4. **Numbered I/O** — `format_numbered_input()` / `parse_numbered_output()`. Explicit `[N] text` anchors for robust line mapping.
 
-6. **Persistent vocabulary** — `parse_vocab()` / `format_vocab()` / `save_vocab()`. Public functions also imported by `proofread.py`.
+5. **Line mapping** — `build_line_mapping()` / `apply_translations()` for SRT block ↔ flat line conversion.
 
-7. **CLI** — `main()` with argparse. Translation only. Key flags: `--endpoint`, `--source-lang`/`--target-lang`, `--chunk-size`, `--repetition-penalty`, `--no-group`, `--no-stream`, `--verbose`, `--extra-payload`, `--suffix`, `--out-dir`, `--retry`, `--vocab`.
+6. **Vocabulary** — `parse_vocab()` / `format_vocab()` / `save_vocab()`. Supports `Source → Target` and `Source -> Target` formats.
 
-### proofread.py — 2-Pass Proofreader
+7. **Input expansion** — `expand_inputs()` handles files, directories, and glob patterns.
 
-Standalone CLI that reviews translated SRT files using a 2-pass pipeline (all with `enable_thinking=False`):
+8. **Manifest/tmp management** — `load_manifest()` / `save_manifest()` / `TmpPaths` helper class for computing paths within per-series tmp folders.
 
-**Step 0** (per-file): Context Building — scene/character summary from sampled lines.
+### Pipeline Steps
 
-**Pass 1 — Vocab Replace & Flag** (mechanical, per-chunk):
-- **Step 1.1**: Strict Vocab Replacement — LLM replaces terms exactly per vocab sheet, nothing else.
-- **Step 1.2**: Confidence Scoring — rates each chunk line HIGH/MEDIUM/LOW on vocab-replaced text. Context from previous chunks passed separately for reference.
+**Step 1 — Input** (`input_step.py`): Expand inputs → warn non-SRT → LLM groups files by series → create tmp folder structure → write manifest.json.
 
-**Pass 2 — Per-Line Correction** (only MEDIUM/LOW lines from Pass 1):
-- **Step 2**: Analyze + Correct — one LLM call per flagged line with ±50 line context window (source+translated pairs). Hard output limit (`expected=300`, `runaway_multiplier=5`, `raise_on_runaway=True`). On runaway or failure, retries up to `--retry` times, then keeps Pass 1 output.
-- **Step 2.3**: Generate Vocab Sheet — one call per file, proper nouns only (names, places, fictional terms). Hard limit with `raise_on_runaway=True` and retry. Output validated: entries >30 chars rejected, capped at 30 entries. Saved to separate file (e.g., `vocab_proofread.txt`).
-- **Step 2.4**: Final Vocab Replacement — apply new vocab sheet strictly across ALL lines.
+**Step 2 — Preprocess** (`preprocess.py`): Per file, 5 passes: (1) context summary — understand the scene first, (2) brainstorm expected words for the scenario, (3) ASR error flagging informed by context + expected words, (4) ASR error fixing, (5) term extraction (high-confidence proper nouns only). Per series: (6) vocab audit — line-by-line verification against context, deletes uncertain entries. Writes context.md and vocab.md.
 
-HIGH lines skip Pass 2 entirely. `--no-vocab-update` skips Steps 2.3-2.4.
+**Step 3 — Translate** (`translate.py`): Chunked translation with numbered-line protocol. Merges series vocab.md with external `--vocab` file. Accumulates rolling glossary across episodes within a series.
 
-Imports shared infrastructure from `main.py` (post_messages, SRT parsing, numbered I/O, vocab functions). Key flags: `--endpoint`, `--out-dir`, `--chunk-size` (default 20), `--context-window`, `--vocab`, `--proofread-vocab`, `--no-vocab-update`.
+**Step 4 — Postprocess** (`postprocess.py`): Compares source+translated pairs against context and vocab, flags unfit lines. Writes flags.json per series.
+
+**Step 5 — Proofread** (`proofread.py`): Pass 1 corrects flagged lines (from flags.json) with ±50 line context. Pass 2 does final audit review. Failed corrections and remaining issues go to confused.md for human review. Copies final output to out/.
+
+### Tmp Folder Structure
+
+```
+./tmp/
+├── manifest.json              # Series grouping + pipeline state
+├── SeriesA/
+│   ├── ep01.srt               # Copied source (overwritten after ASR fix)
+│   ├── ep01.translated.srt    # Step 3 output
+│   ├── context.md             # Step 2: tone, speakers, plot summary
+│   ├── vocab.md               # Step 2: extracted terms
+│   ├── flags.json             # Step 4: {stem: {line_num: reason}}
+│   └── confused.md            # Step 5: lines needing human help
+```
+
+### cli.py — Entry Point
+
+Subcommands: `run`, `input`, `preprocess`, `translate`, `postprocess`, `proofread`.
+
+**`run`** executes all 5 steps sequentially, cleans tmp after (unless `--debug`).
+
+Individual subcommands check prerequisites via manifest `*_done` flags but proceed with a warning if not met. `--debug` enables verbose output and preserves tmp folder.
 
 ## Key Design Decisions
 
-- **Chunked translation**: Small chunks (default 10 lines) prevent the model from looping. Each chunk is translated independently with thinking disabled and high repetition penalty.
-- **Literal first-pass prompt**: Pass 1 translates mechanically without reasoning about context. Uncertain words are flagged with `??` for manual review.
+- **5-step pipeline**: INPUT → Preprocess → Translate → Postprocess → Proofread. Each step reads/writes state in tmp folder. Steps can be run individually for debugging.
+- **ASR pre-processing**: Step 2 builds context first, brainstorms expected words for the scenario, then flags/fixes ASR errors with that knowledge. Context-first approach catches more errors than blind flagging.
+- **Vocab accuracy over coverage**: Term extraction and vocab cleanup prioritize accuracy — a misleading entry is worse than a missing one. Cleanup pass audits line-by-line against context and aggressively deletes uncertain entries.
+- **Chunked translation**: Small chunks (default 10 lines) prevent the model from looping. Literal first-pass prompt with no context reasoning.
 - **Numbered line protocol**: `[N] text` format with regex parsing. Missing lines detected by number, not position.
-- **Runaway handling**: Configurable via `runaway_multiplier` (default 3x) and `raise_on_runaway` (default False). When multiplier > 0 and output exceeds threshold, stream is closed. Default: truncate at repetition pattern and return partial result. With `raise_on_runaway=True`: raise RuntimeError so caller can retry (used by proofread per-line correction and vocab generation).
-- **Series context sharing**: LLM groups files by series from filenames. Glossary accumulated per episode, appended to system prompt for next episode, reset between series.
-- **2-pass proofread**: `proofread.py` is a separate CLI tool. User translates first, optionally edits `vocab.txt`, then runs proofread. Pass 1 is mechanical (vocab replacement first, then confidence scoring on the improved text). Pass 2 corrects each flagged line individually (one LLM call per line, ±50 line context window, hard output limit with raise-on-runaway + retry). Vocab generation produces proper nouns only, validated and capped, saved to separate file. `--no-vocab-update` skips vocab generation and final replacement.
-- **`subs/`** is the conventional input directory; **`out/`** is the conventional output directory.
+- **Runaway handling**: Three layers — exact repetition (≥10x same pattern), reasoning babble (hedge-word density), and multiplier-based length limit. Each step has its own retry/fallback strategy. All flag/reason prompts use structured format: `"wrong_word" → candidate1, candidate2; short reason` to prevent model from reasoning in output.
+- **Series context sharing**: LLM groups files by series from filenames. Context.md + vocab.md shared within series. Rolling glossary across episodes.
+- **flags.json → confused.md**: Postprocess flags problems, proofread attempts fixes. Lines that can't be fixed go to confused.md for human review.
+- **`subs/`** is the conventional input directory; **`out/`** is the conventional output directory; **`tmp/`** is the pipeline state directory.
+
+## Legacy Files
+
+- `main.py` — Original monolithic translator (kept for reference, not used by pipeline)
+- `proofread_legacy.py` — Original monolithic proofreader (kept for reference, not used by pipeline)

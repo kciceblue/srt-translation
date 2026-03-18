@@ -1,6 +1,6 @@
 # SRT 字幕翻译器
 
-通过后端 API 翻译字幕文件，保留时间轴和行结构。利用上下文修正 ASR/Whisper 语音识别错误。自动按系列分组文件，确保角色名称一致。
+通过后端 API 翻译字幕文件，保留时间轴和行结构。5 步流水线：ASR 错误修正 → 翻译 → 质量标记 → 校对。自动按系列分组文件，确保角色名称一致。
 
 ## 安装
 
@@ -19,92 +19,132 @@ pip install -r requirements.txt
 
 ## 使用方法
 
+### 完整流水线
+
 ```bash
-python main.py <输入> --endpoint <API地址> [选项]
+python cli.py run <输入> --endpoint <API地址> [选项]
 ```
 
 输入可以是文件、目录或通配符模式，支持混合使用：
 
 ```bash
 # 单个文件
-python main.py movie.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
+python cli.py run movie.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
 
 # 目录（递归查找所有 .srt 文件）
-python main.py subs/ --endpoint http://127.0.0.1:5000/v1/chat/completions --out-dir out
+python cli.py run subs/ --endpoint http://127.0.0.1:5000/v1/chat/completions --out-dir out
 
 # 混合文件和目录
-python main.py subs/ extras/bonus.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
-
-# 通配符模式
-python main.py "subs/*.srt" --endpoint http://127.0.0.1:5000/v1/chat/completions
+python cli.py run subs/ extras/bonus.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
 
 # 其他语言对
-python main.py subs/ --endpoint http://... --source-lang Korean --target-lang English --suffix .en.srt
+python cli.py run subs/ --endpoint http://... --source-lang Korean --target-lang English --suffix .en.srt
+```
+
+### 逐步运行
+
+使用 `--debug` 保留 tmp 文件夹，可逐步运行流水线以便调试或在步骤之间手动干预。
+
+```bash
+# 步骤 1：输入 — 展开文件、按系列分组、创建 tmp/
+python cli.py input subs/ --endpoint http://... --debug
+
+# 步骤 2：预处理 — ASR 错误修正、上下文摘要、术语提取
+python cli.py preprocess --endpoint http://... --debug
+
+# 步骤 3：翻译 — 分块翻译，使用词汇表+上下文
+python cli.py translate --endpoint http://... --debug
+
+# 步骤 4：后处理 — 标记不合格翻译
+python cli.py postprocess --endpoint http://... --debug
+
+# 步骤 5：校对 — 修正标记行、最终审查、复制到 out/
+python cli.py proofread --endpoint http://... --out-dir out --debug
 ```
 
 ## 参数说明
 
+### 通用参数（所有子命令）
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--endpoint` | http://127.0.0.1:5000 | 后端 API 地址 |
-| `--out-dir` | translated_out | 输出目录 |
-| `--suffix` | .zh.srt | 输出文件名后缀 |
+| `--endpoint` | http://127.0.0.1:5000/v1/chat/completions | 后端 API 地址 |
 | `--source-lang` | Japanese | 源语言名称 |
 | `--target-lang` | Simplified Chinese | 目标语言名称 |
 | `--timeout` | 300 | HTTP 超时时间（秒） |
 | `--retry` | 2 | 失败重试次数 |
 | `--retry-sleep` | 1.0 | 重试间隔（秒） |
-| `--system-prompt` | （内置） | 系统提示词（支持 `{source_lang}` / `{target_lang}` 占位符） |
-| `--user-prefix` | （内置） | 用户消息前缀（支持占位符） |
 | `--extra-payload` | "" | API 请求体的额外 JSON 字段 |
-| `--chunk-size` | 10 | 每块翻译行数（越小越稳定） |
-| `--repetition-penalty` | 1.3 | 所有 LLM 调用的重复惩罚（1.0 禁用） |
-| `--no-group` | false | 禁用系列自动分组 |
 | `--no-stream` | false | 禁用流式传输 |
-| `--verbose` / `-v` | false | 显示详细进度并将 LLM 流式回复输出到 stdout |
-| `--proofread` | false | 校对模式：跳过翻译，使用词汇表校对已有的翻译文件 |
-| `--vocab` | vocab.txt | 词汇表文件 — 启动时加载，每次翻译后自动更新。设为 `''` 禁用。 |
+| `--debug` | false | 详细输出 + 保留 tmp 文件夹 |
+| `--tmp-dir` | ./tmp | 临时文件夹路径 |
+
+### `run` 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--out-dir` | out | 输出目录 |
+| `--suffix` | .zh.srt | 输出文件名后缀 |
+| `--no-group` | false | 禁用系列自动分组 |
+| `--chunk-size` | 10 | 每块翻译行数（越小越稳定） |
+| `--repetition-penalty` | 1.3 | 重复惩罚（1.0 禁用） |
+| `--vocab` | vocab.txt | 外部词汇表文件 |
+
+### `translate` 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--chunk-size` | 10 | 每块翻译行数 |
+| `--repetition-penalty` | 1.3 | 重复惩罚 |
+| `--vocab` | vocab.txt | 外部词汇表文件 |
+
+### `proofread` 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--out-dir` | out | 输出目录 |
+| `--suffix` | .zh.srt | 输出文件名后缀 |
+| `--context-radius` | 50 | 标记行周围的上下文行数 |
 
 ## 工作原理
 
-### 分块翻译
-1. **分块**：将字幕文本按小块（`--chunk-size`，默认 10 行）逐块翻译，小块避免模型陷入循环。
-2. **直译模式**：每块独立翻译，关闭模型思考功能。不确定的词汇用 `??` 标记。
-3. **编号 I/O**：使用 `[N] 文本` 格式精确追踪每一行。缺失行每块有一次修补机会。
+### 流水线总览
 
-### 系列分组
-输入多个文件时，工具会让 LLM 根据文件名自动识别并分组（如按动漫/剧集系列）。同一系列的文件按集数顺序翻译，并共享**术语表**（角色名、地名等关键词），确保跨集命名一致。切换到不同系列时术语表自动重置。使用 `--no-group` 禁用。
-
-### 持久化词汇表
-词汇表文件（默认 `vocab.txt`）在启动时自动加载，每次翻译结束后将新学到的术语合并写回。支持两种格式：
-- `源词 → 译词` — 源语言到目标语言的映射
-- `初翻译文 → 修正译文` — 修正特定的初翻译文
-
-通过 `--vocab` 更改路径，设为 `--vocab ''` 禁用。词汇表同时用于翻译术语表和校对提示，确保命名一致。
-
-### 两步工作流（翻译 → 审校 → 校对）
-
-校对作为**独立步骤**运行，您可以在两步之间审阅和修改自动生成的词汇表：
-
-```bash
-# 第一步：翻译（自动保存学到的词汇到 vocab.txt）
-python main.py subs/ --endpoint http://... --out-dir out
-
-# 第二步：审阅/编辑 vocab.txt — 删除错误条目、修正翻译、添加自定义术语
-
-# 第三步：校对（读取 out-dir 中已有的翻译文件，启用思考模式）
-python main.py subs/ --proofread --endpoint http://... --out-dir out
+```
+输入 → 预处理 → 翻译 → 后处理 → 校对 → 输出
+      (ASR修正)  (分块)  (标记问题)  (修正+审查)
 ```
 
-指定 `--proofread` 时，工具**不执行翻译**。它会在 `--out-dir` 中查找每个输入文件对应的翻译文件（通过 `文件名 + 后缀` 匹配），同时读取源文件和翻译文件，使用词汇表上下文并启用思考模式进行校对，然后覆盖翻译文件。如果未找到翻译文件，会发出警告并跳过。如果校对失败，保留原始翻译。
+### 步骤 1：输入
+展开文件/目录/通配符输入，过滤非 SRT 文件，使用 LLM 根据文件名按系列分组，创建 tmp 文件夹结构，写入 manifest.json。
+
+### 步骤 2：预处理（新功能）
+按文件依次执行 5 个步骤：(1) 生成上下文摘要（语气、说话人、情节），先理解场景；(2) 头脑风暴该场景的常见词汇（专业术语、角色名、常用短语）；(3) 结合上下文和预期词汇标记疑似 ASR 错误；(4) 修正标记的行；(5) 仅提取高置信度的专有名词。按系列：逐条对照上下文审核累积的词汇表，积极删除不确定的条目——误导性的词条比缺失更糟。写入 `context.md` 和 `vocab.md`。
+
+### 步骤 3：翻译
+将字幕按小块（`--chunk-size`，默认 10 行）逐块翻译。每块独立翻译，使用直译提示（关闭思考模式）。使用 `[N] 文本` 编号格式精确追踪每行。缺失行有一次修补机会。合并系列 vocab.md 与外部 `--vocab` 文件。在系列内跨集累积滚动术语表。
+
+### 步骤 4：后处理（新功能）
+比较源文本+翻译对，结合上下文和词汇表标记问题行（词汇不匹配、意思反转、信息缺失、`??` 标记）。写入 `flags.json`。
+
+### 步骤 5：校对
+第一轮：逐行修正每个标记行（每行一次 LLM 调用，±50 行上下文窗口）。第二轮：完整文件最终审查。修正失败和遗留问题写入 `confused.md` 供人工审阅。最终输出复制到 `out/`。
+
+### 系列分组
+输入多个文件时，LLM 根据文件名自动分组。同一系列的文件共享 context.md 和 vocab.md，确保跨集命名一致。使用 `--no-group` 禁用。
 
 ### 溢出检测
-使用 SSE 流式传输监控输出长度。当内容输出超过预期长度 3 倍时，关闭连接并在重复模式处截断已收集的输出（保留前 2 次重复）。使用部分结果继续翻译下一块。使用 `--no-stream` 禁用流式传输。
+SSE 流式传输中有三层保护：
+1. **精确重复** — 如果某个模式重复 10 次以上，立即截断，仅保留 1 次
+2. **推理废话** — 如果模型开始"自言自语"（密集的犹豫词如"Wait,"、"Actually,"、"however"），自动剥离废话部分
+3. **长度倍数** — 如果输出超过预期长度的 N 倍，关闭连接并截断
+
+每个流水线步骤有各自的重试/降级策略。使用 `--no-stream` 禁用。
 
 ## 推荐设置
 
 - **温度 0.2–0.3**：足够低以保持稳定，足够高以避免直译错误内容。通过 `--extra-payload '{"temperature":0.3}'` 设置。
-- **重复惩罚 1.3+**：防止模型循环。如仍有循环可增大。通过 `--repetition-penalty` 设置。
+- **重复惩罚 1.3+**：防止模型循环。如仍有循环可增大。
 - **块大小 10**：默认值。如模型在复杂内容上仍循环，可降至 5。
 
 ## 常见问题
@@ -116,6 +156,8 @@ python main.py subs/ --proofread --endpoint http://... --out-dir out
 **后端错误**：确认 endpoint 地址正确且后端服务已启动
 
 **超时错误**：增大 `--timeout` 值
+
+**流水线中途失败**：使用 `--debug` 保留 tmp/，然后重新运行单个步骤
 
 ## 依赖
 

@@ -15,8 +15,18 @@ out/
 translated_out/
 *.srt
 
+# Pipeline tmp folder
+tmp/
+
 # Vocabulary (user-specific, auto-updated by the tool)
 vocab.txt
+vocab_proofread.txt
+
+# Pipeline artifacts
+confused.md
+
+# Planning docs (local only)
+rework.md
 
 # OS
 .DS_Store

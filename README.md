@@ -2,7 +2,7 @@
 
 [中文文档](README_CN.md)
 
-Translate subtitle files via backend API while preserving timestamps and line structure. Fixes ASR/Whisper transcription errors using context. Auto-groups files by series for consistent character naming.
+Translate subtitle files via backend API while preserving timestamps and line structure. 5-step pipeline: ASR error fixing → translation → quality flagging → proofreading. Auto-groups files by series for consistent character naming.
 
 ## Setup
 
@@ -21,92 +21,132 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Full Pipeline
+
 ```bash
-python main.py <inputs> --endpoint <api_url> [options]
+python cli.py run <inputs> --endpoint <api_url> [options]
 ```
 
 Inputs can be files, directories, or glob patterns — any mix:
 
 ```bash
 # Single file
-python main.py movie.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
+python cli.py run movie.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
 
 # Directory (recursively finds all .srt files)
-python main.py subs/ --endpoint http://127.0.0.1:5000/v1/chat/completions --out-dir out
+python cli.py run subs/ --endpoint http://127.0.0.1:5000/v1/chat/completions --out-dir out
 
 # Mix of files and directories
-python main.py subs/ extras/bonus.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
-
-# Glob pattern
-python main.py "subs/*.srt" --endpoint http://127.0.0.1:5000/v1/chat/completions
+python cli.py run subs/ extras/bonus.srt --endpoint http://127.0.0.1:5000/v1/chat/completions
 
 # Different language pair
-python main.py subs/ --endpoint http://... --source-lang Korean --target-lang English --suffix .en.srt
+python cli.py run subs/ --endpoint http://... --source-lang Korean --target-lang English --suffix .en.srt
+```
+
+### Step-by-Step
+
+Run individual pipeline steps for debugging or manual intervention between steps. Use `--debug` to preserve the tmp folder.
+
+```bash
+# Step 1: Input — expand files, group by series, create tmp/
+python cli.py input subs/ --endpoint http://... --debug
+
+# Step 2: Preprocess — ASR error fix, context summary, term extraction
+python cli.py preprocess --endpoint http://... --debug
+
+# Step 3: Translate — chunked translation with vocab+context
+python cli.py translate --endpoint http://... --debug
+
+# Step 4: Postprocess — flag unfit translations
+python cli.py postprocess --endpoint http://... --debug
+
+# Step 5: Proofread — fix flagged lines, final review, copy to out/
+python cli.py proofread --endpoint http://... --out-dir out --debug
 ```
 
 ## Options
 
+### Common Options (all subcommands)
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--endpoint` | http://127.0.0.1:5000 | Backend API URL |
-| `--out-dir` | translated_out | Output directory |
-| `--suffix` | .zh.srt | Output filename suffix |
+| `--endpoint` | http://127.0.0.1:5000/v1/chat/completions | Backend API URL |
 | `--source-lang` | Japanese | Source language name |
 | `--target-lang` | Simplified Chinese | Target language name |
 | `--timeout` | 300 | HTTP timeout (seconds) |
 | `--retry` | 2 | Retries on failure |
 | `--retry-sleep` | 1.0 | Sleep between retries (seconds) |
-| `--system-prompt` | (built-in) | System prompt (`{source_lang}` / `{target_lang}` placeholders) |
-| `--user-prefix` | (built-in) | User message prefix (supports placeholders) |
 | `--extra-payload` | "" | Extra JSON fields for API body |
-| `--chunk-size` | 10 | Lines per translation chunk (smaller = more stable) |
-| `--repetition-penalty` | 1.3 | Repetition penalty for all LLM calls (1.0 to disable) |
-| `--no-group` | false | Disable series grouping |
 | `--no-stream` | false | Disable streaming |
-| `--verbose` / `-v` | false | Show detailed progress and stream LLM responses to stdout |
-| `--proofread` | false | Proofread mode: skip translation, proofread existing translated files using vocab |
-| `--vocab` | vocab.txt | Vocabulary file — loaded at startup, updated with learnt terms after each run. Set to `''` to disable. |
+| `--debug` | false | Verbose output + preserve tmp folder |
+| `--tmp-dir` | ./tmp | Tmp folder path |
+
+### `run` Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--out-dir` | out | Output directory |
+| `--suffix` | .zh.srt | Output filename suffix |
+| `--no-group` | false | Disable series grouping |
+| `--chunk-size` | 10 | Lines per translation chunk (smaller = more stable) |
+| `--repetition-penalty` | 1.3 | Repetition penalty (1.0 to disable) |
+| `--vocab` | vocab.txt | External vocabulary file |
+
+### `translate` Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--chunk-size` | 10 | Lines per translation chunk |
+| `--repetition-penalty` | 1.3 | Repetition penalty |
+| `--vocab` | vocab.txt | External vocabulary file |
+
+### `proofread` Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--out-dir` | out | Output directory |
+| `--suffix` | .zh.srt | Output filename suffix |
+| `--context-radius` | 50 | Context lines around flagged line |
 
 ## How It Works
 
-### Chunked Translation
-1. **Split into chunks**: Divides subtitle lines into small chunks (`--chunk-size`, default 10). Small chunks prevent the model from looping.
-2. **Literal translation**: Each chunk is translated independently with thinking disabled. Uncertain words are flagged with `??` markers.
-3. **Numbered I/O**: Uses `[N] text` format for precise line tracking. Missing lines get one repair attempt per chunk.
+### Pipeline Overview
 
-### Series Grouping
-When given multiple files, the tool asks the LLM to group them by series (based on filenames). Files in the same series are translated in episode order with a shared **glossary** of character names and key terms, ensuring consistent naming across episodes. The glossary resets between different series. Use `--no-group` to disable.
-
-### Persistent Vocabulary
-A vocabulary file (`vocab.txt` by default) is loaded at startup and updated with learnt terms after each translation run. Entries support two formats:
-- `SourceTerm → TranslatedTerm` — source language to target language mapping
-- `DraftTranslation → Corrected` — fix a specific draft translation
-
-Change the path with `--vocab`, or set `--vocab ''` to disable. Vocabulary is fed into the translation glossary and proofread prompt for consistent naming.
-
-### Two-Step Workflow (Translate → Review → Proofread)
-
-Proofread runs as a **separate invocation** so you can review and curate the auto-generated vocabulary between steps:
-
-```bash
-# Step 1: Translate (saves learnt vocab to vocab.txt)
-python main.py subs/ --endpoint http://... --out-dir out
-
-# Step 2: Review/edit vocab.txt — remove bad entries, fix translations, add custom terms
-
-# Step 3: Proofread (reads existing translations from out-dir, thinking enabled)
-python main.py subs/ --proofread --endpoint http://... --out-dir out
+```
+INPUT → Preprocess → Translate → Postprocess → Proofread → OUTPUT
+         (ASR fix)   (chunked)    (flag bad)    (fix+review)
 ```
 
-When `--proofread` is specified, the tool **does not translate**. It finds each input file's corresponding translated file in `--out-dir` (using `stem + suffix`), reads both source and translated SRT, proofreads with vocabulary context and thinking enabled, then overwrites the translated file. If a translated file is not found, it warns and skips. If proofread fails for a file, the original translation is kept.
+### Step 1: Input
+Expands file/directory/glob inputs, warns about non-SRT files, uses the LLM to group files by series (based on filenames), creates tmp folder structure, and writes manifest.json.
+
+### Step 2: Preprocess (NEW)
+Per file, 5 passes in order: (1) builds a context summary (tone, speakers, plot) to understand the scene first, (2) brainstorms expected words for the scenario (domain vocab, character names, common phrases), (3) flags suspected ASR errors using context + expected words, (4) fixes flagged lines, (5) extracts high-confidence proper nouns only. Per series: audits the accumulated vocabulary line-by-line against context, aggressively removing uncertain entries — a misleading vocab entry is worse than a missing one. Writes `context.md` and `vocab.md` to tmp.
+
+### Step 3: Translate
+Divides subtitle lines into small chunks (`--chunk-size`, default 10). Each chunk is translated independently with a literal translation prompt (thinking disabled). Uses `[N] text` numbered format for precise line tracking. Missing lines get one repair attempt. Merges series vocab.md with external `--vocab` file. Accumulates a rolling glossary across episodes within a series.
+
+### Step 4: Postprocess (NEW)
+Compares source+translated pairs against context and vocabulary. Flags lines with problems (vocab mismatch, reversed meaning, missing info, `??` markers). Writes `flags.json` per series.
+
+### Step 5: Proofread
+Pass 1: Corrects each flagged line individually (one LLM call per line, ±50 line context window). Pass 2: Final audit review of the complete file. Failed corrections and remaining issues go to `confused.md` for human review. Copies final output to `out/`.
+
+### Series Grouping
+When given multiple files, the LLM groups them by series based on filenames. Files in the same series share context.md and vocab.md, ensuring consistent naming across episodes. Use `--no-group` to disable.
 
 ### Runaway Detection
-Uses SSE streaming to monitor output length. If content output exceeds 3x the expected length, the stream is closed and the collected output is truncated at the first repeating pattern (keeping 2 occurrences). The partial result is used and translation continues to the next chunk. Use `--no-stream` to disable streaming.
+Three layers of protection during SSE streaming:
+1. **Exact repetition** — if a pattern repeats 10+ times, the stream is cut and only 1 occurrence is kept
+2. **Reasoning babble** — if the model starts "thinking out loud" (dense hedge words like "Wait,", "Actually,", "however"), the babble is stripped
+3. **Length multiplier** — if output exceeds N× the expected length, the stream is closed and truncated
+
+Each pipeline step has its own retry/fallback strategy. Use `--no-stream` to disable streaming.
 
 ## Recommended Settings
 
 - **Temperature 0.2–0.3**: Low enough to stay stable, high enough to not translate garbled words literally. Set via `--extra-payload '{"temperature":0.3}'`.
-- **Repetition penalty 1.3+**: Prevents the model from looping. Increase if loops persist. Set via `--repetition-penalty`.
+- **Repetition penalty 1.3+**: Prevents the model from looping. Increase if loops persist.
 - **Chunk size 10**: Default. Reduce to 5 if the model still loops on complex content.
 
 ## Troubleshooting
@@ -118,6 +158,8 @@ Uses SSE streaming to monitor output length. If content output exceeds 3x the ex
 **Backend errors**: Ensure endpoint URL is correct and backend is running
 
 **Timeout errors**: Increase `--timeout` value
+
+**Step failed mid-pipeline**: Use `--debug` to preserve tmp/, then re-run individual steps
 
 ## Dependencies
 
